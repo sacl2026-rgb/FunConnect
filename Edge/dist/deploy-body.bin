@@ -1,0 +1,2459 @@
+------FormBoundary368599022
+Content-Disposition: form-data; name="metadata"
+Content-Type: application/json
+
+{"main_module":"worker.mjs","workers_dev":true,"compatibility_date":"2026-07-09","bindings":[{"type":"durable_object_namespace","name":"CYBERPI_HUB","namespace_id":"062eafba943440c693be9a8d90ad9949","class_name":"CyberpiHub"},{"type":"d1","name":"DB","database_id":"a3a8950d-c028-4ef4-b05c-982a10b9b2a6"},{"type":"durable_object_namespace","name":"TENANT_ROSTER","namespace_id":"062eafba943440c693be9a8d90ad9949","class_name":"TenantRoster"}],"keep_bindings":["secret_text"]}
+------FormBoundary368599022
+Content-Disposition: form-data; name="worker.mjs"; filename="worker.mjs"
+Content-Type: application/javascript+module
+
+// ../../Projects/FunConnect/Edge/src/device-hub.ts
+import { DurableObject } from "cloudflare:workers";
+
+// ../../Projects/FunConnect/Edge/src/madgwick.ts
+var DT = 0.04;
+var D2R = Math.PI / 180;
+var BETA_CLEAN = 0.96;
+var BETA_CONTAMINATED = 15e-4;
+var FREEFALL_THRESHOLD = 0.35;
+var FREEFALL_MIN_SAMPLES = 4;
+var STATIONARY_OMEGA = 0.5;
+function madgwick(samples) {
+  let q0 = 1, q1 = 0, q2 = 0, q3 = 0;
+  let maxATransMag = 0;
+  let aTransAtPeak = [0, 0, 0];
+  let maxOmega = 0;
+  let rollEnd = 0, pitchEnd = 0;
+  let sumATransMag = 0;
+  let sumATransMagSq = 0;
+  let sumOmega = 0;
+  let freefallCount = 0;
+  let maxFreefallRun = 0;
+  let rollStart = 0, pitchStart = 0;
+  let count = 0;
+  let samplesBeforeEvent = 0;
+  const omegaHistory = [];
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    if (!s || s.length < 6) continue;
+    let [ax, ay, az, gx, gy, gz] = s;
+    gx *= D2R;
+    gy *= D2R;
+    gz *= D2R;
+    const rawMag = Math.sqrt(ax * ax + ay * ay + az * az);
+    const omegaMag = Math.sqrt(gx * gx + gy * gy + gz * gz);
+    omegaHistory.push(omegaMag);
+    const accelDeviation = Math.abs(rawMag - 1);
+    const beta = accelDeviation < 0.15 && omegaMag < STATIONARY_OMEGA ? BETA_CLEAN : BETA_CONTAMINATED;
+    if (rawMag < FREEFALL_THRESHOLD && rawMag > 1e-4) {
+      freefallCount++;
+      if (freefallCount > maxFreefallRun) maxFreefallRun = freefallCount;
+    } else {
+      freefallCount = 0;
+    }
+    if (rawMag < 1e-4) continue;
+    ax /= rawMag;
+    ay /= rawMag;
+    az /= rawMag;
+    const _2q0 = 2 * q0, _2q1 = 2 * q1, _2q2 = 2 * q2, _2q3 = 2 * q3;
+    const _4q0 = 4 * q0, _4q1 = 4 * q1, _4q2 = 4 * q2;
+    const _8q1 = 8 * q1, _8q2 = 8 * q2;
+    const q0q0 = q0 * q0, q1q1 = q1 * q1, q2q2 = q2 * q2, q3q3 = q3 * q3;
+    let s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+    let s1 = _4q1 * q3q3 - _2q3 * ax + 4 * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
+    let s2 = 4 * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
+    let s3 = 4 * q1q1 * q3 - _2q1 * ax + 4 * q2q2 * q3 - _2q2 * ay;
+    const sn = Math.sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+    if (sn > 1e-4) {
+      s0 /= sn;
+      s1 /= sn;
+      s2 /= sn;
+      s3 /= sn;
+    }
+    const qDot0 = 0.5 * (-q1 * gx - q2 * gy - q3 * gz) - beta * s0;
+    const qDot1 = 0.5 * (q0 * gx + q2 * gz - q3 * gy) - beta * s1;
+    const qDot2 = 0.5 * (q0 * gy - q1 * gz + q3 * gx) - beta * s2;
+    const qDot3 = 0.5 * (q0 * gz + q1 * gy - q2 * gx) - beta * s3;
+    q0 += qDot0 * DT;
+    q1 += qDot1 * DT;
+    q2 += qDot2 * DT;
+    q3 += qDot3 * DT;
+    const qn = Math.sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    if (qn > 1e-4) {
+      q0 /= qn;
+      q1 /= qn;
+      q2 /= qn;
+      q3 /= qn;
+    }
+    const roll = Math.atan2(2 * (q0 * q1 + q2 * q3), 1 - 2 * (q1 * q1 + q2 * q2));
+    const sp = 2 * (q0 * q2 - q3 * q1);
+    const pitch = Math.asin(sp > 1 ? 1 : sp < -1 ? -1 : sp);
+    if (i === 0) {
+      rollStart = roll;
+      pitchStart = pitch;
+    }
+    rollEnd = roll;
+    pitchEnd = pitch;
+    const cr = Math.cos(roll), sr = Math.sin(roll);
+    const cp = Math.cos(pitch), sp2 = Math.sin(pitch);
+    const atx = cp * s[0] + sp2 * sr * s[1] - sp2 * cr * s[2];
+    const aty = cr * s[1] + sr * s[2];
+    const atz = -sp2 * s[0] + cp * sr * s[1] + cp * cr * s[2] - 1;
+    const aTransMag = Math.sqrt(atx * atx + aty * aty + atz * atz);
+    sumATransMag += aTransMag;
+    sumATransMagSq += aTransMag * aTransMag;
+    sumOmega += omegaMag;
+    if (omegaMag > maxOmega) maxOmega = omegaMag;
+    if (aTransMag > maxATransMag) {
+      maxATransMag = aTransMag;
+      aTransAtPeak = [atx, aty, atz];
+    }
+    count++;
+  }
+  const avgATrans = count > 0 ? sumATransMag / count : 0;
+  const avgOmega = count > 0 ? sumOmega / count : 0;
+  const aTransVar = count > 0 ? sumATransMagSq / count - avgATrans * avgATrans : 0;
+  const deltaRollDeg = Math.abs(rollEnd - rollStart) * 180 / Math.PI;
+  const deltaPitchDeg = Math.abs(pitchEnd - pitchStart) * 180 / Math.PI;
+  const deltaAngleDeg = deltaRollDeg + deltaPitchDeg;
+  const first5 = omegaHistory.slice(0, 5);
+  const stationaryBefore = first5.length > 0 && first5.every((w) => w < STATIONARY_OMEGA);
+  const freefallDetected = maxFreefallRun >= FREEFALL_MIN_SAMPLES;
+  let classification = "unknown";
+  if (freefallDetected) {
+    classification = "freefall";
+  } else if (maxATransMag > 2.5) {
+    classification = "crash";
+  } else if (maxATransMag > 1.5 && maxOmega > 5) {
+    classification = "crash";
+  } else if (maxATransMag < 0.3 && deltaAngleDeg > 15 && maxOmega < 2) {
+    classification = "tilt";
+  } else if (aTransVar > 0.5 && avgATrans < 0.3 && deltaAngleDeg < 5) {
+    classification = "vibration";
+  } else if (maxATransMag > 0.3 && maxATransMag <= 2.5 && stationaryBefore) {
+    classification = "bump";
+  } else if (maxATransMag > 0.3 && maxATransMag <= 2.5) {
+    classification = "bump";
+  } else {
+    classification = "unknown";
+  }
+  return {
+    a_trans: {
+      x: round3(aTransAtPeak[0]),
+      y: round3(aTransAtPeak[1]),
+      z: round3(aTransAtPeak[2])
+    },
+    roll: round2(rollEnd * 180 / Math.PI),
+    pitch: round2(pitchEnd * 180 / Math.PI),
+    freefall: freefallDetected,
+    freefall_samples: maxFreefallRun,
+    stationary: stationaryBefore,
+    classification
+  };
+}
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+function round3(n) {
+  return Math.round(n * 1e3) / 1e3;
+}
+
+// ../../Projects/FunConnect/Edge/src/device-hub.ts
+var MIGRATIONS = [
+  {
+    id: 1,
+    description: "hello_log + _migrations + _flush_registry",
+    sql: `CREATE TABLE IF NOT EXISTS hello_log (
+      device_id TEXT NOT NULL, timestamp INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS _migrations (
+      id INTEGER PRIMARY KEY, description TEXT, applied_at INTEGER);
+      CREATE TABLE IF NOT EXISTS _flush_registry (
+      local_table TEXT PRIMARY KEY, d1_table TEXT NOT NULL)`
+  },
+  {
+    id: 2,
+    description: "telemetry_buffer",
+    sql: `CREATE TABLE IF NOT EXISTS telemetry_buffer (
+      device_id TEXT NOT NULL,
+      tilt REAL, vibration REAL,
+      acc_x REAL, acc_y REAL, acc_z REAL,
+      gyro_x REAL, gyro_y REAL, gyro_z REAL,
+      uptime_ms INTEGER, do_ms INTEGER)`
+  },
+  {
+    id: 3,
+    description: "health columns on telemetry_buffer",
+    sql: `ALTER TABLE telemetry_buffer ADD COLUMN health_mem INTEGER;
+      ALTER TABLE telemetry_buffer ADD COLUMN health_reconns INTEGER;
+      ALTER TABLE telemetry_buffer ADD COLUMN health_errs INTEGER;
+      ALTER TABLE telemetry_buffer ADD COLUMN health_rot INTEGER`
+  },
+  {
+    id: 4,
+    description: "alert_buffer",
+    sql: `CREATE TABLE IF NOT EXISTS alert_buffer (
+      device_id TEXT NOT NULL, event TEXT NOT NULL,
+      accel_peak REAL, omega_peak REAL,
+      signature INTEGER, samples TEXT, do_ms INTEGER)`
+  },
+  {
+    id: 5,
+    description: "madgwick_json on alert_buffer",
+    sql: `ALTER TABLE alert_buffer ADD COLUMN madgwick_json TEXT`
+  },
+  {
+    id: 6,
+    description: "telemetry_buffer UPSERT \u2014 UNIQUE on device_id, WITHOUT ROWID",
+    sql: `CREATE TABLE IF NOT EXISTS telemetry_buffer_v2 (
+      device_id TEXT PRIMARY KEY,
+      tilt REAL, vibration REAL,
+      acc_x REAL, acc_y REAL, acc_z REAL,
+      gyro_x REAL, gyro_y REAL, gyro_z REAL,
+      uptime_ms INTEGER, do_ms INTEGER,
+      health_mem INTEGER, health_reconns INTEGER, health_errs INTEGER, health_rot INTEGER
+    ) WITHOUT ROWID;
+    INSERT OR IGNORE INTO telemetry_buffer_v2 SELECT * FROM telemetry_buffer;
+    DROP TABLE telemetry_buffer;
+    ALTER TABLE telemetry_buffer_v2 RENAME TO telemetry_buffer`
+  },
+  {
+    id: 7,
+    description: "tenant_id on buffer tables",
+    sql: `ALTER TABLE hello_log ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'admin';
+          ALTER TABLE telemetry_buffer ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'admin';
+          ALTER TABLE alert_buffer ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'admin'`
+  },
+  {
+    id: 8,
+    description: "conversation_buffer for multi-turn chat context",
+    sql: `CREATE TABLE IF NOT EXISTS conversation_buffer (
+      tenant_id  TEXT NOT NULL DEFAULT 'admin',
+      device_id  TEXT NOT NULL,
+      role       TEXT NOT NULL,
+      content    TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )`
+  }
+];
+var CyberpiHub = class extends DurableObject {
+  deviceWs = null;
+  dashboards = /* @__PURE__ */ new Map();
+  lastTelemetry = {};
+  lastMotors = {};
+  lastLeds = [];
+  pendingEcho = null;
+  pendingExec = null;
+  pendingFsTest = null;
+  /** ledState via sync KV — survives hibernation, zero await. */
+  get ledState() {
+    return this.ctx.storage.kv.get("ledState") ?? false;
+  }
+  set ledState(v) {
+    this.ctx.storage.kv.put("ledState", v);
+  }
+  // ── Constructor ────────────────────────────────────────────────────────
+  constructor(ctx, env) {
+    super(ctx, env);
+    ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS _migrations (id INTEGER PRIMARY KEY, description TEXT, applied_at INTEGER)"
+    );
+    for (const m of MIGRATIONS) {
+      const done = ctx.storage.sql.exec(
+        "SELECT 1 FROM _migrations WHERE id = ?",
+        m.id
+      );
+      if ([...done].length > 0) continue;
+      for (const stmt of m.sql.split(";").map((s) => s.trim()).filter((s) => s.length > 0)) {
+        try {
+          ctx.storage.sql.exec(stmt);
+        } catch {
+        }
+      }
+      ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO _migrations (id, description, applied_at) VALUES (?, ?, ?)",
+        m.id,
+        m.description,
+        Date.now()
+      );
+    }
+    ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO _flush_registry (local_table, d1_table) VALUES (?, ?)",
+      "hello_log",
+      "hello_log"
+    );
+    ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO _flush_registry (local_table, d1_table) VALUES (?, ?)",
+      "telemetry_buffer",
+      "telemetry"
+    );
+    ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO _flush_registry (local_table, d1_table) VALUES (?, ?)",
+      "alert_buffer",
+      "alerts"
+    );
+    ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO _flush_registry (local_table, d1_table) VALUES (?, ?)",
+      "conversation_buffer",
+      "chat_history"
+    );
+    ctx.getWebSockets().forEach((ws) => {
+      const meta = ws.deserializeAttachment();
+      if (meta?.role === "cyberpi") {
+        this.deviceWs = ws;
+      } else if (meta?.role === "dashboard") {
+        this.dashboards.set(ws, meta);
+      }
+    });
+  }
+  // ── fetch(): WebSocket Upgrade + debug endpoints ────────────────────────
+  async fetch(request) {
+    const url = new URL(request.url);
+    const tenantId = url.searchParams.get("tenant") || "admin";
+    if (url.pathname === "/do-hello-count" && request.method === "GET") {
+      const deviceId2 = url.searchParams.get("device") || "cyberpi";
+      const cursor = this.ctx.storage.sql.exec(
+        "SELECT COUNT(*) as cnt FROM hello_log WHERE device_id = ?",
+        deviceId2
+      );
+      const row = [...cursor][0];
+      return new Response(JSON.stringify({
+        device_id: deviceId2,
+        count: row?.cnt || 0
+      }), { headers: { "Content-Type": "application/json" } });
+    }
+    if (url.pathname === "/do-telemetry-count" && request.method === "GET") {
+      const deviceId2 = url.searchParams.get("device") || "cyberpi";
+      const cursor = this.ctx.storage.sql.exec(
+        "SELECT COUNT(*) as cnt FROM telemetry_buffer WHERE device_id = ?",
+        deviceId2
+      );
+      const row = [...cursor][0];
+      return new Response(JSON.stringify({
+        device_id: deviceId2,
+        count: row?.cnt || 0
+      }), { headers: { "Content-Type": "application/json" } });
+    }
+    if (url.pathname === "/do-telemetry-sample" && request.method === "GET") {
+      const deviceId2 = url.searchParams.get("device") || "cyberpi";
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "3"), 10);
+      const cursor = this.ctx.storage.sql.exec(
+        `SELECT device_id, tilt, vibration,
+                acc_x, acc_y, acc_z,
+                gyro_x, gyro_y, gyro_z,
+                uptime_ms, do_ms,
+                health_mem, health_reconns, health_errs, health_rot
+         FROM telemetry_buffer WHERE device_id = ?
+         ORDER BY rowid DESC LIMIT ?`,
+        deviceId2,
+        limit
+      );
+      const rows = [...cursor].map((r) => ({
+        device_id: r.device_id,
+        tilt: r.tilt,
+        vibration: r.vibration,
+        acc_x: r.acc_x,
+        acc_y: r.acc_y,
+        acc_z: r.acc_z,
+        gyro_x: r.gyro_x,
+        gyro_y: r.gyro_y,
+        gyro_z: r.gyro_z,
+        uptime_ms: r.uptime_ms,
+        do_ms: r.do_ms,
+        health: { mem: r.health_mem, reconns: r.health_reconns, errs: r.health_errs, rot: r.health_rot }
+      }));
+      return new Response(JSON.stringify({ device_id: deviceId2, rows }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    if (url.pathname === "/api/live-status" && request.method === "GET") {
+      const deviceId2 = url.searchParams.get("device") || "cyberpi";
+      const att2 = this.deviceWs?.deserializeAttachment();
+      const telCursor = this.ctx.storage.sql.exec(
+        "SELECT COUNT(*) as cnt FROM telemetry_buffer WHERE device_id = ?",
+        deviceId2
+      );
+      const alertCursor = this.ctx.storage.sql.exec(
+        "SELECT COUNT(*) as cnt FROM alert_buffer WHERE device_id = ?",
+        deviceId2
+      );
+      return new Response(JSON.stringify({
+        device_id: deviceId2,
+        device_type: att2?.deviceType || "cyberpi",
+        online: this.deviceWs !== null,
+        dashboard_count: this.dashboards.size,
+        buffer_telemetry: [...telCursor][0]?.cnt || 0,
+        buffer_alerts: [...alertCursor][0]?.cnt || 0
+      }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+    }
+    if (url.pathname === "/do-alert-count" && request.method === "GET") {
+      const deviceId2 = url.searchParams.get("device") || "cyberpi";
+      const cursor = this.ctx.storage.sql.exec(
+        "SELECT COUNT(*) as cnt FROM alert_buffer WHERE device_id = ?",
+        deviceId2
+      );
+      const row = [...cursor][0];
+      return new Response(JSON.stringify({
+        device_id: deviceId2,
+        count: row?.cnt || 0
+      }), { headers: { "Content-Type": "application/json" } });
+    }
+    if (url.pathname === "/do-recent-alerts" && request.method === "GET") {
+      const deviceId2 = url.searchParams.get("device") || "cyberpi";
+      const cursor = this.ctx.storage.sql.exec(
+        `SELECT device_id, event, signature, do_ms, madgwick_json
+           FROM alert_buffer WHERE device_id = ? ORDER BY do_ms DESC LIMIT 25`,
+        deviceId2
+      );
+      const alerts = [...cursor].map((r) => ({
+        device_id: r.device_id,
+        event: r.event,
+        signature: r.signature,
+        do_ms: r.do_ms,
+        madgwick_json: r.madgwick_json
+      }));
+      return new Response(JSON.stringify({ alerts }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    if (url.pathname === "/do-conversation-buffer" && request.method === "GET") {
+      const deviceId2 = url.searchParams.get("device") || "cyberpi";
+      const cursor = this.ctx.storage.sql.exec(
+        `SELECT role, content, created_at
+           FROM conversation_buffer WHERE device_id = ?
+           ORDER BY created_at ASC LIMIT 8`,
+        deviceId2
+      );
+      const turns = [...cursor].map((r) => ({
+        role: r.role,
+        content: r.content,
+        created_at: r.created_at
+      }));
+      return new Response(JSON.stringify({ turns }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    if (url.pathname === "/do-conversation-append" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        const did = body.device_id || "cyberpi";
+        const tid = body.tenant_id || tenantId;
+        const turns = body.turns || [];
+        for (const t of turns) {
+          if (!t.role || !t.content) continue;
+          this.ctx.storage.sql.exec(
+            "INSERT INTO conversation_buffer (tenant_id, device_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+            tid,
+            did,
+            t.role,
+            t.content,
+            Math.floor(Date.now() / 1e3)
+          );
+        }
+        this.ctx.storage.sql.exec(
+          `DELETE FROM conversation_buffer
+           WHERE rowid NOT IN (
+             SELECT rowid FROM conversation_buffer
+             ORDER BY created_at DESC LIMIT 8
+           )`
+        );
+        return new Response(null, { status: 204 });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+    if (url.pathname === "/api/device-ids" && request.method === "GET") {
+      const cursor = this.ctx.storage.sql.exec(
+        "SELECT device_id, COUNT(*) as cnt FROM telemetry_buffer GROUP BY device_id ORDER BY cnt DESC LIMIT 20"
+      );
+      const rows = [...cursor].map((r) => ({ device_id: r.device_id, count: r.cnt }));
+      return new Response(JSON.stringify({ devices: rows }), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+    if (url.pathname === "/api/debug" && request.method === "GET") {
+      const wsList = this.ctx.getWebSockets();
+      return new Response(JSON.stringify({
+        deviceWs: !!this.deviceWs,
+        wsCount: wsList.length,
+        wsRoles: wsList.map((w) => {
+          try {
+            return w.deserializeAttachment()?.role || "none";
+          } catch {
+            return "error";
+          }
+        })
+      }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+    }
+    if (url.pathname === "/api/echo" && request.method === "POST") {
+      if (!this.deviceWs) {
+        return new Response(JSON.stringify({ error: "device not connected" }), {
+          status: 503,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        return new Response(JSON.stringify({ error: "invalid json" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+      const text = body.text || "hello";
+      const sendTs = Date.now();
+      const ackPromise = new Promise((resolve, reject) => {
+        this.pendingEcho = { resolve, reject };
+        this.deviceWs.send(JSON.stringify({ command: "echo", params: { text } }));
+        setTimeout(() => {
+          if (this.pendingEcho) {
+            this.pendingEcho.reject(new Error("echo timeout"));
+            this.pendingEcho = null;
+          }
+        }, 1e4);
+      });
+      try {
+        const result = await ackPromise;
+        const att2 = this.deviceWs?.deserializeAttachment();
+        return new Response(JSON.stringify({
+          device_id: att2?.deviceId || "unknown",
+          text: result.text,
+          device_ts: result.deviceTs,
+          rtt_ms: result.rttMs
+        }), {
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 504,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+    }
+    if (url.pathname === "/api/exec" && request.method === "POST") {
+      if (!this.deviceWs) {
+        return new Response(JSON.stringify({ error: "device not connected" }), {
+          status: 503,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        return new Response(JSON.stringify({ error: "invalid json" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+      const sendTs = Date.now();
+      const ackPromise = new Promise((resolve, reject) => {
+        this.pendingExec = { resolve, reject };
+        this.deviceWs.send(JSON.stringify({ command: "exec", code: body.code || "" }));
+        setTimeout(() => {
+          if (this.pendingExec) {
+            this.pendingExec.reject(new Error("exec timeout"));
+            this.pendingExec = null;
+          }
+        }, 1e4);
+      });
+      try {
+        const result = await ackPromise;
+        return new Response(JSON.stringify({
+          status: result.status,
+          error: result.error,
+          rtt_ms: Date.now() - sendTs
+        }), {
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 504,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+    }
+    if (url.pathname === "/api/fs-test" && request.method === "POST") {
+      if (!this.deviceWs) {
+        return new Response(JSON.stringify({ error: "device not connected" }), {
+          status: 503,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+      const ackPromise = new Promise((resolve, reject) => {
+        this.pendingFsTest = { resolve, reject };
+        this.deviceWs.send(JSON.stringify({ command: "fs_test" }));
+        setTimeout(() => {
+          if (this.pendingFsTest) {
+            this.pendingFsTest.reject(new Error("fs_test timeout"));
+            this.pendingFsTest = null;
+          }
+        }, 1e4);
+      });
+      try {
+        const result = await ackPromise;
+        return new Response(JSON.stringify({
+          write: result.write,
+          read: result.read,
+          delete: result.delete,
+          error: result.error
+        }), {
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 504,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+    }
+    const upgradeHeader = request.headers.get("Upgrade");
+    if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
+      return new Response("Expected Upgrade: websocket", { status: 426 });
+    }
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server);
+    const segments = url.pathname.split("/").filter(Boolean);
+    const deviceId = segments.length >= 2 ? segments[1] : "unknown";
+    const isDashboard = segments[0] === "dashboard";
+    const role = isDashboard ? "dashboard" : "cyberpi";
+    const att = { role, deviceId, tenantId, deviceType: "cyberpi" };
+    server.serializeAttachment(att);
+    if (isDashboard) {
+      this.dashboards.set(server, att);
+      if (this.lastTelemetry && Object.keys(this.lastTelemetry).length > 0) {
+        server.send(JSON.stringify({
+          type: "state",
+          device_id: deviceId,
+          connected: this.deviceWs !== null,
+          telemetry: this.lastTelemetry,
+          motors: this.lastMotors,
+          leds: this.lastLeds,
+          doTs: Date.now()
+        }));
+      }
+      const MIN_BUFFER_FOR_SKIP_D1 = 5;
+      const sentMs = /* @__PURE__ */ new Set();
+      const alertCursor = this.ctx.storage.sql.exec(
+        "SELECT device_id, event, accel_peak, omega_peak, signature, do_ms, madgwick_json FROM alert_buffer WHERE device_id = ? ORDER BY do_ms DESC LIMIT 30",
+        deviceId
+      );
+      const alertRows = [...alertCursor];
+      for (let i = alertRows.length - 1; i >= 0; i--) {
+        const r = alertRows[i];
+        if (r.do_ms != null) sentMs.add(r.do_ms);
+        server.send(JSON.stringify({
+          type: "alert",
+          device_id: r.device_id,
+          event: r.event,
+          accel_peak: r.accel_peak,
+          omega_peak: r.omega_peak,
+          signature: r.signature,
+          madgwick_json: typeof r.madgwick_json === "string" ? JSON.parse(r.madgwick_json) : null,
+          do_ms: r.do_ms
+        }));
+      }
+      if (alertRows.length < MIN_BUFFER_FOR_SKIP_D1) {
+        try {
+          const d1Result = await this.env.DB.prepare(
+            `SELECT device_id, event, accel_peak, omega_peak, signature, do_ms, madgwick_json
+             FROM alerts WHERE device_id = ?1 AND tenant_id = ?2 AND madgwick_json IS NOT NULL
+             ORDER BY COALESCE(do_ms, created_at*1000) DESC LIMIT 20`
+          ).bind(deviceId, tenantId).all();
+          const d1Rows = d1Result.results ?? [];
+          for (let i = d1Rows.length - 1; i >= 0; i--) {
+            const row = d1Rows[i];
+            if (row.do_ms != null && sentMs.has(row.do_ms)) continue;
+            if (row.do_ms != null) sentMs.add(row.do_ms);
+            server.send(JSON.stringify({
+              type: "alert",
+              device_id: row.device_id,
+              event: row.event,
+              accel_peak: row.accel_peak,
+              omega_peak: row.omega_peak,
+              signature: row.signature,
+              madgwick_json: typeof row.madgwick_json === "string" ? JSON.parse(row.madgwick_json) : row.madgwick_json,
+              do_ms: row.do_ms
+            }));
+          }
+        } catch (err) {
+          console.error("[CyberpiHub] D1 alert replay failed:", err);
+        }
+      }
+    } else {
+      if (this.deviceWs) {
+        try {
+          this.deviceWs.close(1e3, "Replaced");
+        } catch {
+        }
+      }
+      this.deviceWs = server;
+    }
+    return new Response(null, { status: 101, webSocket: client });
+  }
+  // ── webSocketMessage(): Hot Path — ZERO awaits ─────────────────────────
+  async webSocketMessage(ws, raw) {
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      ws.send(JSON.stringify({ type: "error", message: "invalid json" }));
+      return;
+    }
+    switch (data.type) {
+      case "hello": {
+        const att = ws.deserializeAttachment();
+        const deviceId = data.device_id || att.deviceId || "cyberpi";
+        const deviceType = data.device_type || att.deviceType || "cyberpi";
+        const tenant = att.tenantId || "admin";
+        ws.serializeAttachment({ ...att, deviceId, deviceType });
+        this.ctx.storage.sql.exec(
+          "INSERT INTO hello_log (device_id, timestamp, tenant_id) VALUES (?, ?, ?)",
+          deviceId,
+          Date.now(),
+          tenant
+        );
+        ws.send(JSON.stringify({ type: "welcome", device_id: deviceId }));
+        ws.send(JSON.stringify({ type: "sync", device_id: deviceId, led: this.ledState, doTs: Date.now() }));
+        this.ctx.waitUntil(this.registerInRoster(deviceId, deviceType, tenant));
+        this.ctx.waitUntil(this.ctx.storage.setAlarm(Date.now() + 6e4));
+        break;
+      }
+      case "state": {
+        const att = ws.deserializeAttachment();
+        const deviceId = data.device_id || att.deviceId || "cyberpi";
+        const tenant = att.tenantId || "admin";
+        const telemetry = data.telemetry || {};
+        const health = data.health || {};
+        const now = Date.now();
+        this.ctx.storage.sql.exec(
+          `INSERT OR REPLACE INTO telemetry_buffer
+             (device_id, tilt, vibration, acc_x, acc_y, acc_z,
+              gyro_x, gyro_y, gyro_z, uptime_ms, do_ms,
+              health_mem, health_reconns, health_errs, health_rot, tenant_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          deviceId,
+          telemetry.tilt ?? null,
+          telemetry.vibration ?? null,
+          telemetry.acc_x ?? null,
+          telemetry.acc_y ?? null,
+          telemetry.acc_z ?? null,
+          telemetry.gyro_x ?? null,
+          telemetry.gyro_y ?? null,
+          telemetry.gyro_z ?? null,
+          data.esp32_ms ?? null,
+          now,
+          health.mem ?? null,
+          health.reconns ?? null,
+          health.errs ?? null,
+          health.rot ?? null,
+          tenant
+        );
+        this.lastTelemetry = telemetry;
+        this.lastMotors = data.motors || {};
+        this.lastLeds = data.leds || [];
+        this.broadcast({
+          type: "state",
+          device_id: deviceId,
+          connected: true,
+          telemetry: this.lastTelemetry,
+          motors: this.lastMotors,
+          leds: this.lastLeds,
+          doTs: now
+        });
+        const bufCursor = this.ctx.storage.sql.exec(
+          "SELECT COUNT(*) as cnt FROM telemetry_buffer WHERE device_id = ?",
+          deviceId
+        );
+        const bufRow = [...bufCursor][0];
+        const alertCursor = this.ctx.storage.sql.exec(
+          "SELECT COUNT(*) as cnt FROM alert_buffer WHERE device_id = ?",
+          deviceId
+        );
+        const alertRow = [...alertCursor][0];
+        const lastFlush = this.ctx.storage.kv.get("last_flush_ms") || 0;
+        ws.send(JSON.stringify({
+          type: "ack",
+          ref: "state",
+          doTs: now,
+          buf: bufRow?.cnt || 0,
+          alert_depth: alertRow?.cnt || 0,
+          last_flush_ms: lastFlush
+        }));
+        this.ctx.waitUntil(this.ctx.storage.setAlarm(Date.now() + 6e4));
+        break;
+      }
+      case "alert": {
+        const att = ws.deserializeAttachment();
+        const deviceId = data.device_id || att.deviceId || "cyberpi";
+        const tenant = att.tenantId || "admin";
+        const now = Date.now();
+        const samples = data.samples || [];
+        const mResult = samples.length > 0 ? madgwick(samples) : null;
+        this.ctx.storage.sql.exec(
+          `INSERT INTO alert_buffer
+             (device_id, event, accel_peak, omega_peak, signature, samples, do_ms, madgwick_json, tenant_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          deviceId,
+          data.event ?? null,
+          data.accel_peak ?? null,
+          data.omega_peak ?? null,
+          data.signature ?? null,
+          JSON.stringify(samples),
+          now,
+          mResult ? JSON.stringify(mResult) : null,
+          tenant
+        );
+        ws.send(JSON.stringify({ type: "ack", ref: "alert", doTs: now }));
+        this.broadcast({
+          type: "alert",
+          device_id: deviceId,
+          event: data.event ?? null,
+          accel_peak: data.accel_peak ?? null,
+          omega_peak: data.omega_peak ?? null,
+          signature: data.signature ?? null,
+          madgwick_json: mResult,
+          do_ms: now
+        });
+        this.ctx.waitUntil(this.ctx.storage.setAlarm(Date.now() + 6e4));
+        break;
+      }
+      case "echo_ack": {
+        if (this.pendingEcho) {
+          const deviceTs = data.ts || 0;
+          this.pendingEcho.resolve({
+            text: data.text || "",
+            deviceTs,
+            rttMs: Math.abs(Date.now() - (deviceTs || Date.now()))
+          });
+          this.pendingEcho = null;
+        }
+        break;
+      }
+      case "exec_ack": {
+        if (this.pendingExec) {
+          this.pendingExec.resolve({
+            status: data.status || "error",
+            error: data.error ?? null
+          });
+          this.pendingExec = null;
+        }
+        break;
+      }
+      case "fs_ack": {
+        if (this.pendingFsTest) {
+          this.pendingFsTest.resolve({
+            write: !!data.write,
+            read: !!data.read,
+            delete: !!data.delete,
+            error: data.error || null
+          });
+          this.pendingFsTest = null;
+        }
+        break;
+      }
+      default:
+        ws.send(JSON.stringify({ type: "error", message: `unknown type: ${data.type}` }));
+    }
+  }
+  // ── alarm(): Generic D1 Flush — Cold Path ──────────────────────────────
+  /**
+   * Discovers buffer tables from _flush_registry at runtime.
+   * Adding a new buffer table requires: constructor (CREATE TABLE + _registerBuffer)
+   * and webSocketMessage (INSERT). The alarm never changes.
+   *
+   * Prototype pattern: try/catch per table, outer try/catch, finally { setAlarm }.
+   */
+  async alarm() {
+    try {
+      let registry = this.ctx.storage.sql.exec(
+        "SELECT local_table, d1_table FROM _flush_registry"
+      ).toArray();
+      if (registry.length === 0) {
+        registry = [
+          { local_table: "hello_log", d1_table: "hello_log" },
+          { local_table: "telemetry_buffer", d1_table: "telemetry" },
+          { local_table: "alert_buffer", d1_table: "alerts" }
+        ];
+      }
+      for (const entry of registry) {
+        const localTable = entry.local_table;
+        const d1Table = entry.d1_table;
+        try {
+          const colInfo = this.ctx.storage.sql.exec(
+            `PRAGMA table_info(${localTable})`
+          ).toArray();
+          const cols = colInfo.map((c) => c.name);
+          const rows = this.ctx.storage.sql.exec(
+            `SELECT ${cols.join(", ")} FROM ${localTable}`
+          ).toArray();
+          if (rows.length === 0) continue;
+          const placeholders = cols.map((_, i) => `?${i + 1}`).join(", ");
+          const stmts = rows.map(
+            (row) => this.env.DB.prepare(
+              `INSERT INTO ${d1Table} (${cols.join(", ")}) VALUES (${placeholders})`
+            ).bind(...cols.map((c) => row[c]))
+          );
+          await this.env.DB.batch(stmts);
+          if (localTable !== "telemetry_buffer" && localTable !== "conversation_buffer") {
+            this.ctx.storage.sql.exec(`DELETE FROM ${localTable}`);
+          }
+        } catch (err) {
+          console.error(`[CyberpiHub] ${localTable} flush failed, retaining rows:`, err);
+        }
+      }
+      try {
+        const countRow = this.ctx.storage.sql.exec(
+          "SELECT COUNT(*) as cnt FROM telemetry_buffer"
+        ).toArray();
+        const bufferRows = countRow[0]?.cnt || 0;
+        if (bufferRows === 0) {
+          const checkCycle = this.ctx.storage.kv.get("cleanup_cycle") || 0;
+          this.ctx.storage.kv.put("cleanup_cycle", (checkCycle + 1) % 60);
+          if (checkCycle === 0) {
+            const d1Count = await this.env.DB.prepare(
+              "SELECT COUNT(*) as cnt FROM telemetry"
+            ).first();
+            const total = d1Count?.cnt || 0;
+            const CEILING = 2e4;
+            if (total > CEILING) {
+              const excess = total - CEILING;
+              await this.env.DB.prepare(
+                "DELETE FROM telemetry WHERE id IN (SELECT id FROM telemetry ORDER BY id ASC LIMIT ?1)"
+              ).bind(excess).run();
+              console.log(`[CyberpiHub] D1 cleanup: deleted ${excess} oldest rows`);
+            }
+          }
+        }
+      } catch (err) {
+        console.error("[CyberpiHub] D1 cleanup error:", err);
+      }
+      const oneDayAgoMs = Date.now() - 864e5;
+      try {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM alert_buffer WHERE do_ms < ?",
+          oneDayAgoMs
+        );
+      } catch (err) {
+        console.error("[CyberpiHub] alert_buffer age cleanup failed:", err);
+      }
+      try {
+        await this.env.DB.prepare(
+          "DELETE FROM alerts WHERE COALESCE(do_ms, created_at*1000) < ?1"
+        ).bind(oneDayAgoMs).run();
+      } catch (err) {
+        console.error("[CyberpiHub] D1 alerts age cleanup failed:", err);
+      }
+      this.ctx.storage.kv.put("last_flush_ms", Date.now());
+    } catch (e) {
+      console.error("[CyberpiHub] alarm outer error:", e);
+    } finally {
+      await this.ctx.storage.setAlarm(Date.now() + 6e4);
+    }
+  }
+  // ── Broadcast Helper ──────────────────────────────────────────────────
+  broadcast(data) {
+    const json2 = JSON.stringify(data);
+    this.dashboards.forEach((_, ws) => {
+      try {
+        ws.send(json2);
+      } catch {
+        this.dashboards.delete(ws);
+      }
+    });
+  }
+  // ── Roster Registration ───────────────────────────────────────────────
+  /**
+   * Fire-and-forget registration with the tenant's roster DO.
+   * Called via waitUntil() from the hello handler — does not block the
+   * hot path. Failures are logged but never surface to the device.
+   */
+  async registerInRoster(deviceId, deviceType, tenant) {
+    try {
+      const rosterId = this.env.TENANT_ROSTER.idFromName(`${tenant}/roster`);
+      const stub = this.env.TENANT_ROSTER.get(rosterId);
+      const res = await stub.fetch("https://internal/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: deviceId, device_type: deviceType })
+      });
+      if (!res.ok) {
+        console.error(`[CyberpiHub] roster register failed: ${res.status}`);
+      }
+    } catch (err) {
+      console.error("[CyberpiHub] roster registration error:", err);
+    }
+  }
+  // ── webSocketClose / webSocketError ────────────────────────────────────
+  async webSocketClose(ws, code, reason, _wasClean) {
+    const meta = ws.deserializeAttachment();
+    if (meta?.role === "cyberpi") this.deviceWs = null;
+    else if (meta?.role === "dashboard") this.dashboards.delete(ws);
+    ws.close(code, reason);
+  }
+  async webSocketError(ws, _error) {
+    const meta = ws.deserializeAttachment();
+    if (meta?.role === "cyberpi") this.deviceWs = null;
+    else if (meta?.role === "dashboard") this.dashboards.delete(ws);
+  }
+};
+
+// ../../Projects/FunConnect/Edge/src/roster.ts
+import { DurableObject as DurableObject2 } from "cloudflare:workers";
+var MIGRATIONS2 = [
+  {
+    id: 1,
+    description: "devices table",
+    sql: `CREATE TABLE IF NOT EXISTS devices (
+      device_id TEXT PRIMARY KEY,
+      device_type TEXT NOT NULL DEFAULT 'cyberpi',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )`
+  }
+];
+var TenantRoster = class extends DurableObject2 {
+  constructor(ctx, env) {
+    super(ctx, env);
+    ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS _migrations (id INTEGER PRIMARY KEY, description TEXT, applied_at INTEGER)"
+    );
+    for (const m of MIGRATIONS2) {
+      const done = ctx.storage.sql.exec(
+        "SELECT 1 FROM _migrations WHERE id = ?",
+        m.id
+      );
+      if ([...done].length > 0) continue;
+      for (const stmt of m.sql.split(";").map((s) => s.trim()).filter((s) => s.length > 0)) {
+        try {
+          ctx.storage.sql.exec(stmt);
+        } catch {
+        }
+      }
+      ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO _migrations (id, description, applied_at) VALUES (?, ?, ?)",
+        m.id,
+        m.description,
+        Date.now()
+      );
+    }
+  }
+  // ── fetch() ────────────────────────────────────────────────────────────
+  async fetch(request) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const CORS2 = {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*"
+    };
+    const json2 = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: CORS2 });
+    if (path === "/register" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        if (!body.device_id) return json2({ error: "device_id required" }, 400);
+        const now = Date.now();
+        this.ctx.storage.sql.exec(
+          `INSERT INTO devices (device_id, device_type, created_at, updated_at)
+           VALUES (?1, ?2, ?3, ?3)
+           ON CONFLICT(device_id) DO UPDATE SET
+             device_type = COALESCE(?2, device_type),
+             updated_at = ?3`,
+          body.device_id,
+          body.device_type || "cyberpi",
+          now
+        );
+        return json2({ success: true, device_id: body.device_id });
+      } catch (err) {
+        return json2({ error: err.message }, 500);
+      }
+    }
+    if (path === "/list" && request.method === "GET") {
+      const cursor = this.ctx.storage.sql.exec(
+        "SELECT device_id, device_type, created_at, updated_at FROM devices ORDER BY updated_at DESC LIMIT 100"
+      );
+      const devices = [...cursor].map((r) => ({
+        device_id: r.device_id,
+        device_type: r.device_type,
+        created_at: r.created_at,
+        updated_at: r.updated_at
+      }));
+      return json2({ devices });
+    }
+    const deviceMatch = path.match(/^\/([^/]+)$/);
+    if (deviceMatch && request.method === "GET") {
+      const cursor = this.ctx.storage.sql.exec(
+        "SELECT device_id, device_type, created_at, updated_at FROM devices WHERE device_id = ?",
+        deviceMatch[1]
+      );
+      const row = [...cursor][0];
+      if (!row) return json2({ error: "device not found" }, 404);
+      return json2({
+        device_id: row.device_id,
+        device_type: row.device_type,
+        created_at: row.created_at,
+        updated_at: row.updated_at
+      });
+    }
+    return json2({ error: "not found" }, 404);
+  }
+};
+
+// ../../Projects/FunConnect/Edge/src/catalog-data.ts
+var CATALOG = [
+  {
+    id: "hello-world",
+    name: "Hello World",
+    description: "Connect your CyberPi to WiFi and say hello to the cloud. The simplest way to verify your device is online.",
+    tags: ["beginner", "wifi", "display"],
+    version: "1.0.0",
+    content: `# hello-world.py \u2014 FunConnect Catalog
+# Flash this to your CyberPi via mBlock to say hello to the cloud.
+# After upload, the device connects and appears on your dashboard.
+
+import socket
+import ussl
+import ustruct
+import ujson
+import time
+import network
+from cyberpi import *
+
+# \u2500\u2500 Config \u2500\u2500
+WIFI_SSID = "YOUR_WIFI"
+WIFI_PASS = "YOUR_PASSWORD"
+DEVICE_ID = "cyberpi"
+WSS_URL = "ws://funconnect-v1.funconnect.workers.dev/device/" + DEVICE_ID
+
+# \u2500\u2500 Connect WiFi \u2500\u2500
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+wlan.connect(WIFI_SSID, WIFI_PASS)
+while not wlan.isconnected():
+    time.sleep(0.5)
+
+display.show_label("WiFi OK", 16, 10, 10)
+
+# \u2500\u2500 WebSocket Handshake \u2500\u2500
+# (simplified \u2014 real firmware uses a WSS client library)
+console.print("Connected! Visit funconnect-v1.funconnect.workers.dev")
+`
+  },
+  {
+    id: "led-blink",
+    name: "LED Blink",
+    description: "Cycle the CyberPi LEDs through colors while reporting state to your cloud dashboard.",
+    tags: ["beginner", "led", "dashboard"],
+    version: "1.0.0",
+    content: `# led-blink.py \u2014 FunConnect Catalog
+# Blinks the CyberPi LEDs and reports state to the cloud dashboard.
+
+import time
+from cyberpi import *
+
+# \u2500\u2500 Config \u2500\u2500
+WIFI_SSID = "YOUR_WIFI"
+WIFI_PASS = "YOUR_PASSWORD"
+DEVICE_ID = "cyberpi"
+
+console.print("LED Blink starting...")
+console.print("Connect to WiFi: " + WIFI_SSID)
+
+# LEDs will cycle through colors while connected
+led_colors = [(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255)]
+for i in range(5):
+    r, g, b = led_colors[i % 5]
+    led.on(r, g, b)
+    time.sleep(1)
+    led.off()
+    time.sleep(0.5)
+`
+  },
+  {
+    id: "imu-stream",
+    name: "IMU Stream",
+    description: "Stream accelerometer and gyroscope data to the cloud. Shake the board to trigger disturbance alerts on your dashboard.",
+    tags: ["intermediate", "imu", "alerts", "sensors"],
+    version: "1.0.0",
+    content: `# imu-stream.py \u2014 FunConnect Catalog
+# Streams accelerometer and gyroscope data to the cloud.
+# Shake the CyberPi to trigger disturbance alerts.
+
+import time
+from cyberpi import *
+
+# \u2500\u2500 Config \u2500\u2500
+WIFI_SSID = "YOUR_WIFI"
+WIFI_PASS = "YOUR_PASSWORD"
+DEVICE_ID = "cyberpi"
+
+console.print("IMU Stream starting...")
+console.print("Shake the board to see alerts on the dashboard!")
+
+# The cloud DO runs Madgwick AHRS on disturbance events.
+# Your job: send 50-sample 6-DOF ring buffers on impact.
+# The firmware handles all of this \u2014 just flash and shake.
+
+prev_acc = (0, 0, 0)
+while True:
+    ax = accelerometer.get_x()
+    ay = accelerometer.get_y()
+    az = accelerometer.get_z()
+    gx = gyroscope.get_x()
+    gy = gyroscope.get_y()
+    gz = gyroscope.get_z()
+
+    # Simple jerk detection: any axis delta > threshold = disturbance
+    jerk = abs(ax - prev_acc[0]) + abs(ay - prev_acc[1]) + abs(az - prev_acc[2])
+    if jerk > 0.5:
+        console.print("Disturbance! Jerk: " + str(jerk))
+
+    prev_acc = (ax, ay, az)
+    time.sleep(0.04)  # 25 Hz
+`
+  }
+];
+
+// ../../Projects/FunConnect/Edge/src/spa-data.ts
+var SPA_HTML = '<!doctype html>\r\n<html lang="en">\r\n<head>\r\n<meta charset="utf-8" />\r\n<meta name="viewport" content="width=device-width, initial-scale=1" />\r\n<title>FunConnect \u2014 plug in, pick a program, go</title>\r\n\r\n<!-- React from CDN. No build step (yet), per Alpha\'s brief. -->\r\n<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>\r\n<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>\r\n\r\n<style>\r\n  :root {\r\n    --bg: #0a0e14;\r\n    --panel: #141a26;\r\n    --panel-2: #1a1f2e;\r\n    --line: #26303f;\r\n    --ink: #e8eef6;\r\n    --muted: #8a99ad;\r\n    --brand: #37e0a6;\r\n    --brand-2: #2bb3ff;\r\n    --warn: #ffb454;\r\n    --bad: #ff6b6b;\r\n    --radius: 14px;\r\n    --shadow: 0 10px 40px rgba(0,0,0,.45);\r\n  }\r\n  * { box-sizing: border-box; }\r\n  html, body { margin: 0; height: 100%; }\r\n  body {\r\n    background:\r\n      radial-gradient(1200px 600px at 80% -10%, rgba(43,179,255,.10), transparent),\r\n      radial-gradient(900px 500px at -10% 20%, rgba(55,224,166,.10), transparent),\r\n      var(--bg);\r\n    color: var(--ink);\r\n    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, system-ui, sans-serif;\r\n    -webkit-font-smoothing: antialiased;\r\n  }\r\n  a { color: var(--brand-2); }\r\n  #root { min-height: 100%; }\r\n\r\n  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }\r\n  .brandbar { display:flex; align-items:center; gap:12px; margin-bottom: 8px; }\r\n  .logo {\r\n    width: 34px; height: 34px; border-radius: 9px;\r\n    background: linear-gradient(135deg, var(--brand), var(--brand-2));\r\n    display:grid; place-items:center; color:#04121a; font-weight:800;\r\n    box-shadow: var(--shadow);\r\n  }\r\n  .brandbar h1 { font-size: 18px; margin:0; letter-spacing:.2px; }\r\n  .brandbar .sub { color: var(--muted); font-size: 12.5px; }\r\n\r\n  /* Stepper */\r\n  .steps { display:flex; gap:8px; flex-wrap:wrap; margin: 18px 0 26px; }\r\n  .step {\r\n    display:flex; align-items:center; gap:8px; padding:8px 12px;\r\n    border:1px solid var(--line); border-radius: 999px; color: var(--muted);\r\n    background: var(--panel); font-size: 13px; white-space:nowrap;\r\n  }\r\n  .step .dot {\r\n    width:20px;height:20px;border-radius:50%; display:grid;place-items:center;\r\n    background: var(--panel-2); color: var(--muted); font-size:11px; font-weight:700;\r\n    border:1px solid var(--line);\r\n  }\r\n  .step.active { color: var(--ink); border-color: var(--brand); box-shadow: 0 0 0 1px rgba(55,224,166,.25) inset; }\r\n  .step.active .dot { background: var(--brand); color:#04121a; border-color: var(--brand); }\r\n  .step.done .dot { background: var(--brand-2); color:#03121c; border-color: var(--brand-2); }\r\n\r\n  .card {\r\n    background: var(--panel); border:1px solid var(--line); border-radius: var(--radius);\r\n    box-shadow: var(--shadow); padding: 22px;\r\n  }\r\n  .grid { display:grid; gap:16px; }\r\n  @media (min-width: 860px){ .cols-2 { grid-template-columns: 1fr 1fr; } }\r\n\r\n  h2 { font-size: 20px; margin: 2px 0 6px; }\r\n  h3 { font-size: 15px; margin: 0 0 6px; }\r\n  p.lead { color: var(--muted); margin: 0 0 18px; }\r\n\r\n  .btn {\r\n    appearance:none; border:1px solid transparent; border-radius: 10px;\r\n    padding: 11px 16px; font-weight: 650; font-size: 14px; cursor:pointer;\r\n    background: linear-gradient(135deg, var(--brand), var(--brand-2)); color:#04121a;\r\n    transition: transform .06s ease, filter .15s ease;\r\n  }\r\n  .btn:hover { filter: brightness(1.05); }\r\n  .btn:active { transform: translateY(1px); }\r\n  .btn:disabled { opacity:.45; cursor:not-allowed; filter:none; }\r\n  .btn.ghost { background: transparent; color: var(--ink); border-color: var(--line); }\r\n  .btn.ghost:hover { border-color: var(--brand); }\r\n  .btn.sm { padding: 7px 11px; font-size: 12.5px; border-radius: 8px; }\r\n\r\n  .pill { display:inline-flex; align-items:center; gap:7px; padding:5px 10px; border-radius:999px;\r\n          font-size:12px; border:1px solid var(--line); background: var(--panel-2); color: var(--muted); }\r\n  .pill .led { width:8px;height:8px;border-radius:50%; background: var(--muted); }\r\n  .pill.ok { color: var(--brand); border-color: rgba(55,224,166,.4); }\r\n  .pill.ok .led { background: var(--brand); box-shadow: 0 0 10px var(--brand); }\r\n  .pill.bad { color: var(--bad); border-color: rgba(255,107,107,.4); }\r\n  .pill.bad .led { background: var(--bad); }\r\n  .pill.wait .led { background: var(--warn); animation: blink 1s infinite; }\r\n  @keyframes blink { 50% { opacity:.25; } }\r\n\r\n  .tags { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }\r\n  .tag { font-size:11px; color: var(--brand-2); border:1px solid rgba(43,179,255,.35);\r\n         padding:2px 8px; border-radius:999px; text-transform:capitalize; }\r\n\r\n  .catalog { display:grid; gap:12px; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); }\r\n  .prog {\r\n    background: var(--panel-2); border:1px solid var(--line); border-radius:12px; padding:14px;\r\n    cursor:pointer; transition: border-color .15s ease, transform .06s ease;\r\n  }\r\n  .prog:hover { border-color: var(--brand); }\r\n  .prog.selected { border-color: var(--brand); box-shadow: 0 0 0 1px rgba(55,224,166,.3) inset; }\r\n  .prog h3 { display:flex; justify-content:space-between; align-items:center; gap:8px; }\r\n  .prog .ver { font-size:11px; color: var(--muted); font-weight:500; }\r\n  .prog p { color: var(--muted); font-size:13px; margin:6px 0 0; }\r\n\r\n  .field { display:flex; gap:10px; align-items:center; }\r\n  input[type=text], input[type=password] {\r\n    background: var(--panel-2); border:1px solid var(--line); color: var(--ink);\r\n    padding:10px 12px; border-radius:10px; font-size:14px; width:100%; font-family: ui-monospace, Menlo, monospace;\r\n  }\r\n  input[type=text]:focus, input[type=password]:focus { outline:none; border-color: var(--brand); }\r\n  label.lbl { font-size:12.5px; color: var(--muted); display:block; margin-bottom:6px; }\r\n\r\n  pre.code {\r\n    background:#070b11; border:1px solid var(--line); border-radius:10px; padding:14px;\r\n    overflow:auto; max-height: 340px; font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;\r\n    color:#cfe3ff; margin:0;\r\n  }\r\n  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em;\r\n         background: rgba(43,179,255,.12); border:1px solid var(--line); padding:1px 5px; border-radius:5px; color:#cfe3ff; }\r\n\r\n  .frame-wrap { position:relative; border:1px solid var(--line); border-radius:12px; overflow:hidden; background:#fff; }\r\n  iframe.mblock { width:100%; height:520px; border:0; display:block; background:#fff; }\r\n  .overlay-note {\r\n    position:absolute; top:10px; left:10px; z-index:5;\r\n    background: rgba(10,14,20,.82); backdrop-filter: blur(4px);\r\n    border:1px solid var(--brand); color: var(--ink);\r\n    border-radius:10px; padding:10px 12px; font-size:12.5px; max-width: 280px;\r\n  }\r\n  .overlay-note b { color: var(--brand); }\r\n\r\n  .guide { display:grid; gap:10px; }\r\n  .guide .g {\r\n    display:flex; gap:12px; align-items:flex-start; padding:12px;\r\n    border:1px solid var(--line); border-radius:10px; background: var(--panel-2);\r\n  }\r\n  .guide .n { flex:0 0 auto; width:24px;height:24px;border-radius:7px; display:grid;place-items:center;\r\n    background: var(--brand); color:#04121a; font-weight:800; font-size:12px; }\r\n  .guide .g.dim { opacity:.55; }\r\n\r\n  .stat { background: var(--panel-2); border:1px solid var(--line); border-radius:12px; padding:14px; }\r\n  .stat .k { color: var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.06em; }\r\n  .stat .v { font-size:26px; font-weight:750; margin-top:4px; font-variant-numeric: tabular-nums; }\r\n  .stat .u { font-size:13px; color: var(--muted); font-weight:500; }\r\n\r\n  .tiltbox { height:170px; display:grid; place-items:center; position:relative; overflow:hidden;\r\n    border:1px solid var(--line); border-radius:12px; background:\r\n      linear-gradient(180deg, rgba(43,179,255,.06), transparent); }\r\n  .horizon { width:170px; height:170px; position:relative; }\r\n  .plane {\r\n    position:absolute; inset:0; margin:auto; width:150px; height:6px; border-radius:6px;\r\n    background: linear-gradient(90deg, var(--brand-2), var(--brand));\r\n    transition: transform .25s ease; transform-origin:center;\r\n    box-shadow: 0 0 16px rgba(43,179,255,.5);\r\n  }\r\n  .plane::before { content:""; position:absolute; left:50%; top:50%; width:14px;height:14px;\r\n    border-radius:50%; transform:translate(-50%,-50%); background:#fff; box-shadow:0 0 12px #fff; }\r\n\r\n  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }\r\n  .between { display:flex; justify-content:space-between; align-items:center; gap:12px; }\r\n  .muted { color: var(--muted); }\r\n  .err { color: var(--bad); font-size:13px; }\r\n  .hr { height:1px; background: var(--line); margin:18px 0; border:0; }\r\n  .toast {\r\n    position:fixed; bottom:20px; left:50%; transform:translateX(-50%);\r\n    background: var(--panel-2); border:1px solid var(--brand); color: var(--ink);\r\n    padding:10px 16px; border-radius:10px; box-shadow: var(--shadow); z-index:50; font-size:13.5px;\r\n  }\r\n  .success-burst { text-align:center; padding: 30px 10px; }\r\n  .success-burst .ring {\r\n    width:88px;height:88px;border-radius:50%; margin:0 auto 14px;\r\n    display:grid;place-items:center; font-size:40px;\r\n    background: radial-gradient(circle, rgba(55,224,166,.25), transparent 70%);\r\n    border:2px solid var(--brand); color: var(--brand);\r\n    animation: pop .5s ease;\r\n  }\r\n  @keyframes pop { 0%{transform:scale(.6);opacity:0} 60%{transform:scale(1.08)} 100%{transform:scale(1);opacity:1} }\r\n  .spinner { width:16px;height:16px;border-radius:50%; border:2px solid var(--line); border-top-color: var(--brand);\r\n    display:inline-block; animation: spin .8s linear infinite; vertical-align:-3px; }\r\n  @keyframes spin { to { transform: rotate(360deg); } }\r\n\r\n  /* ---- Deploy overlay (bank-grade) ---- */\r\n  .overlay-full {\r\n    position:fixed; inset:0; z-index:60; display:grid; place-items:center; padding:24px;\r\n    background:\r\n      radial-gradient(1200px 700px at 50% -10%, rgba(43,179,255,.12), transparent),\r\n      rgba(6,9,14,.86);\r\n    backdrop-filter: blur(8px); animation: fadein .25s ease;\r\n  }\r\n  .modal {\r\n    width:100%; max-width:640px; background:var(--panel); border:1px solid var(--line);\r\n    border-radius:18px; box-shadow:0 24px 80px rgba(0,0,0,.6); padding:26px;\r\n    animation: modalin .35s cubic-bezier(.2,.7,.2,1);\r\n  }\r\n  @keyframes modalin { from { opacity:0; transform:translateY(12px) scale(.98); } to { opacity:1; transform:none; } }\r\n  @keyframes fadein { from { opacity:0; } to { opacity:1; } }\r\n  .modal-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:18px; }\r\n  .eyebrow { font-size:12px; letter-spacing:.14em; text-transform:uppercase; color:var(--brand); font-weight:750; margin-bottom:3px; }\r\n  .x { background:transparent; border:1px solid var(--line); color:var(--muted); width:34px; height:34px;\r\n       border-radius:9px; cursor:pointer; font-size:14px; transition:.15s; }\r\n  .x:hover { border-color:var(--bad); color:var(--bad); }\r\n\r\n  .progress-dots { display:flex; align-items:center; gap:10px; margin-bottom:24px; }\r\n  .dot-lg { width:30px; height:30px; border-radius:50%; display:grid; place-items:center; font-weight:700;\r\n            font-size:13px; background:var(--panel-2); border:1px solid var(--line); color:var(--muted); transition:.25s; }\r\n  .dot-lg.active { background:var(--brand); color:#04121a; border-color:var(--brand); box-shadow:0 0 0 4px rgba(55,224,166,.18); }\r\n  .dot-lg.done { background:var(--brand-2); color:#03121c; border-color:var(--brand-2); }\r\n  .stepcount { margin-left:auto; font-size:13px; color:var(--muted); }\r\n\r\n  .substep { animation: fadein .3s ease; }\r\n  .substep h3 { font-size:21px; margin:0 0 8px; }\r\n  .substep > p { font-size:16px; color:var(--muted); line-height:1.55; margin:0 0 18px; }\r\n  .illus { display:grid; place-items:center; padding:16px; margin-bottom:18px; border:1px solid var(--line);\r\n           border-radius:14px; background:linear-gradient(180deg, rgba(43,179,255,.06), transparent); }\r\n  .btn.lg { padding:14px 22px; font-size:16px; border-radius:12px; width:100%; }\r\n  .btn.block { display:block; width:100%; }\r\n\r\n  .pulsebar { display:flex; align-items:center; gap:10px; padding:12px 14px; border-radius:12px; margin-bottom:18px;\r\n              border:1px solid rgba(43,179,255,.35); background:rgba(43,179,255,.07); font-size:15px; }\r\n  .pulsedot { width:10px; height:10px; border-radius:50%; background:var(--brand-2);\r\n              box-shadow:0 0 12px var(--brand-2); animation:pulse 1.2s infinite; }\r\n  @keyframes pulse { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:.35; transform:scale(.7); } }\r\n\r\n  .mini { display:grid; gap:10px; margin:4px 0 18px; }\r\n  .mini .m { display:flex; gap:12px; align-items:flex-start; padding:12px 14px; border:1px solid var(--line);\r\n             border-radius:12px; background:var(--panel-2); font-size:15px; line-height:1.5; }\r\n  .mini .mn { flex:0 0 auto; width:26px; height:26px; border-radius:8px; display:grid; place-items:center;\r\n              background:var(--brand); color:#04121a; font-weight:800; font-size:13px; }\r\n\r\n  .waiting { display:flex; align-items:center; gap:8px; font-size:15px; color:var(--muted); margin-top:6px; }\r\n  .confetti-canvas { position:fixed; inset:0; pointer-events:none; z-index:70; }\r\n  .connected-screen { text-align:center; max-width:520px; }\r\n  .ring-xl { width:104px; height:104px; border-radius:50%; margin:6px auto 14px; display:grid; place-items:center;\r\n             font-size:52px; color:var(--brand); border:3px solid var(--brand);\r\n             background:radial-gradient(circle, rgba(55,224,166,.25), transparent 70%); animation:pop .5s ease; }\r\n\r\n  /* ---- Disturbance alerts ---- */\r\n  .alert-layout { display:grid; gap:16px; }\r\n  @media (min-width: 720px){ .alert-layout { grid-template-columns: 260px 1fr; } }\r\n  .alert-list { display:flex; flex-direction:column; gap:6px; max-height:300px; overflow:auto; }\r\n  .alert-row { display:flex; align-items:center; gap:8px; width:100%; text-align:left; cursor:pointer;\r\n               background:var(--panel-2); border:1px solid var(--line); border-radius:10px; padding:9px 11px;\r\n               color:var(--ink); font-size:13px; transition:.12s; }\r\n  .alert-row:hover { border-color:var(--brand); }\r\n  .alert-row.sel { border-color:var(--brand); box-shadow:0 0 0 1px rgba(55,224,166,.3) inset; }\r\n  .ar-dot { width:9px; height:9px; border-radius:50%; flex:0 0 auto; }\r\n  .ar-cls { text-transform:capitalize; font-weight:650; }\r\n  .ar-meta { color:var(--muted); }\r\n  .ar-time { margin-left:auto; color:var(--muted); font-size:12px; }\r\n\r\n  .alert-detail { background:var(--panel-2); border:1px solid var(--line); border-radius:12px; padding:16px; }\r\n  .class-badge { display:inline-flex; align-items:center; gap:7px; padding:5px 12px; border-radius:999px;\r\n                 border:1px solid; font-size:13px; font-weight:700; text-transform:capitalize; letter-spacing:.02em; }\r\n  .cbdot { width:8px; height:8px; border-radius:50%; }\r\n  .gauge { margin:10px 0; }\r\n  .gauge-top { display:flex; justify-content:space-between; font-size:13px; color:var(--muted); margin-bottom:6px; }\r\n  .gauge-top b { color:var(--ink); font-variant-numeric:tabular-nums; }\r\n  .gauge-track { position:relative; height:8px; border-radius:6px; background:var(--panel);\r\n                 border:1px solid var(--line); overflow:hidden; }\r\n  .gauge-zero { position:absolute; left:50%; top:0; bottom:0; width:1px; background:var(--line); }\r\n  .gauge-fill { position:absolute; top:0; bottom:0; background:linear-gradient(90deg, var(--brand-2), var(--brand)); }\r\n  .dev-input { background:var(--panel-2); border:1px solid var(--line); color:var(--ink); padding:5px 9px;\r\n               border-radius:8px; font:13px ui-monospace, Menlo, monospace; width:160px; }\r\n  .dev-input:focus { outline:none; border-color:var(--brand); }\r\n\r\n  /* ---- Auth + admin ---- */\r\n  .splash { min-height:100vh; display:grid; place-items:center; gap:18px; align-content:center; }\r\n  .logo.lg { width:56px; height:56px; font-size:26px; border-radius:15px; }\r\n  .auth-wrap { min-height:100vh; display:grid; place-items:center; padding:24px; }\r\n  .auth-card { width:100%; max-width:380px; background:var(--panel); border:1px solid var(--line);\r\n               border-radius:16px; padding:26px; box-shadow:var(--shadow); }\r\n  .auth-card .brandbar h1 { font-size:18px; }\r\n  .admin-grid { display:grid; gap:16px; }\r\n  @media (min-width:820px){ .admin-grid { grid-template-columns: 260px 1fr; align-items:start; } }\r\n  .tabbar { display:flex; gap:4px; margin-bottom:18px; border-bottom:1px solid var(--line); }\r\n  .tab { background:transparent; border:0; border-bottom:2px solid transparent; color:var(--muted);\r\n         padding:10px 16px; margin-bottom:-1px; cursor:pointer; font-size:14px; font-weight:650; }\r\n  .tab:hover { color:var(--ink); }\r\n  .tab.active { color:var(--ink); border-bottom-color:var(--brand); }\r\n\r\n  /* ---- Chat widget ---- */\r\n  .chat { display:flex; flex-direction:column; gap:12px; }\r\n  .chat-log { display:flex; flex-direction:column; gap:10px; max-height:340px; overflow:auto; padding-right:4px; }\r\n  .msg { max-width:88%; padding:10px 13px; border-radius:13px; font-size:14px; line-height:1.5; word-wrap:break-word; }\r\n  .msg.user { align-self:flex-end; background:linear-gradient(135deg,var(--brand),var(--brand-2)); color:#04121a; border-bottom-right-radius:4px; }\r\n  .msg.bot { align-self:flex-start; background:var(--panel-2); border:1px solid var(--line); border-bottom-left-radius:4px; }\r\n  .msg.bot.error { border-color:rgba(255,107,107,.4); color:var(--bad); }\r\n  .chat-ctx { margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; }\r\n  .chat-ctx .cx { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--line);\r\n                  background:var(--panel); color:var(--muted); text-transform:capitalize; }\r\n  .chat-empty { margin-top:8px; font-size:12.5px; color:var(--warn); }\r\n  .typing { display:inline-flex; gap:5px; align-items:center; padding:2px 0; }\r\n  .typing i { width:6px; height:6px; border-radius:50%; background:var(--muted); animation:blink 1.2s infinite; }\r\n  .typing i:nth-child(2){ animation-delay:.2s } .typing i:nth-child(3){ animation-delay:.4s }\r\n  .suggest { display:flex; gap:6px; flex-wrap:wrap; }\r\n  .chat-input { display:flex; gap:8px; }\r\n  .chat-input input { flex:1; width:auto; }\r\n</style>\r\n</head>\r\n<body>\r\n<div id="root"></div>\r\n<div id="fc-diag" style="position:fixed;top:0;left:0;color:#0f0;background:rgba(0,0,0,.85);padding:4px 8px;font:11px monospace;z-index:99999">PAGE LOADED</div>\r\n\r\n<script>\r\n(()=>{var z=null;function he(e){if(!z||!z.writer)return!1;try{return z.writer.write(new TextEncoder().encode(e+`\n`)),!0}catch{return!1}}function fe(e,t,a){let n=new BroadcastChannel("relay");z={port:e,ws:t,deviceId:a,channel:n,writer:i},z.channel=n;let s=e.readable.getReader(),i=e.writable.getWriter(),o=new TextDecoder,l="",r=!1;(async()=>{try{for(;;){let{value:b,done:v}=await s.read();if(v)break;!r&&b&&b.length>0&&(r=!0,n.postMessage({type:"first-byte",deviceId:a})),l+=o.decode(b);let p=l.split(`\n`);l=p.pop();for(let c of p){let m=c.trim();m&&t.readyState===WebSocket.OPEN&&t.send(m)}}}catch{}})(),t.addEventListener("message",b=>{try{i.write(new TextEncoder().encode(b.data+`\n`))}catch{}}),e.addEventListener("disconnect",()=>{ue()}),n.postMessage({type:"connected",deviceId:a})}async function ue(){if(!z)return;let{port:e,ws:t,deviceId:a,channel:n}=z;z=null;try{t.close()}catch{}try{await e.close()}catch{}n&&(n.postMessage({type:"disconnected",deviceId:a}),n.close())}typeof window<"u"&&window.addEventListener("beforeunload",()=>{if(z&&z.port){try{z.ws.close()}catch{}try{z.port.close()}catch{}z=null}});var{useState:u,useEffect:B,useRef:W,useCallback:te}=React,O="https://funconnect-v1.funconnect.workers.dev",Te="wss://funconnect-v1.funconnect.workers.dev",Re="https://ide.mblock.cc/",K="cyberpi",ge="https://mblock.makeblock.com/en-us/download/",H={cyberpi:{id:"cyberpi",name:"CyberPi",description:"ESP32 microcontroller with IMU, LCD, and LED ring",connection:{method:"USB",tool:"mBlock"},defaultDeviceId:"cyberpi",catalogTag:"cyberpi",telemetry:{dashboardPanel:"imu"},deploy:{transport:"popup",programFormat:".py"},transports:[{id:"serial",label:"USB (WebSerial)",description:"Direct USB connection \\u2014 no WiFi setup, no mBlock. Requires relay.py flashed to the board.",deviceId:"cyberpi"},{id:"wifi",label:"WiFi (mBlock)",description:"Flash via mBlock \\u2014 requires WiFi + mLink2. Works with any CyberPi program.",deviceId:"cyberpi"}]},microbit:{id:"microbit",name:"micro:bit",description:"ARM Cortex-M0 with 5\\xD75 LED matrix, accelerometer, and edge connector",connection:{method:"USB",tool:"Serial"},defaultDeviceId:"microbit-01",catalogTag:"microbit",telemetry:{dashboardPanel:"microbit"},deploy:{transport:"serial",programFormat:".hex"},transports:[{id:"serial",label:"USB (WebSerial)",description:"Direct USB connection \\u2014 plug in and connect. No WiFi setup.",deviceId:"microbit-01"}]}},ye={heart:[0,1,0,1,0,1,1,1,1,1,1,1,1,1,1,0,1,1,1,0,0,0,1,0,0],smile:[0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,1,0,0,0,1,0,1,1,1,0],sad:[0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,1,1,1,0,1,0,0,0,1],star:[0,0,1,0,0,0,0,1,0,0,1,1,1,1,1,0,0,1,0,0,0,0,1,0,0],clear:[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]},Ee="http://localhost:52384/funconnect/ping";async function be(e=1400){let t=new AbortController,a=setTimeout(()=>t.abort(),e);try{let n=await fetch(Ee,{signal:t.signal,cache:"no-store"});return clearTimeout(a),n.ok}catch{return clearTimeout(a),!1}}var we=[{key:"detect",label:"Connect Device"},{key:"catalog",label:"Choose Program"},{key:"deploy",label:"Deploy"},{key:"dashboard",label:"Live"}];async function We(){let e=await fetch(`${O}/api/catalog`,{cache:"no-store"});if(!e.ok)throw new Error(`catalog HTTP ${e.status}`);return e.json()}async function Be(e){let t=await fetch(`${O}/api/catalog/${encodeURIComponent(e)}`,{cache:"no-store"});if(!t.ok)throw new Error(`download HTTP ${t.status}`);return t.text()}async function ae(e){let t=await fetch(`${O}/api/device/${encodeURIComponent(e)}/status`,{cache:"no-store"});if(!t.ok)throw new Error(`status HTTP ${t.status}`);return t.json()}async function $e(e){let t=[],a={};try{let r=await fetch(`${O}/api/devices`,{cache:"no-store"});if(r.ok){let b=await r.json();t=Array.isArray(b)?b:b&&b.devices||[]}}catch{}let n=t.map(r=>typeof r=="string"?{device_id:r}:r).filter(r=>r&&r.device_id).sort((r,b)=>(b.last_seen||b.last_seen_ms||0)-(r.last_seen||r.last_seen_ms||0));n.forEach(r=>{r.device_type&&(a[r.device_id]=r.device_type)});let s=n.find(r=>r.online);if(s)return{device_id:s.device_id,device_type:s.device_type||a[s.device_id]||"cyberpi"};let i=r=>r.replace(/-r\\d+$/,""),o=[],l=r=>{r&&!o.includes(r)&&o.push(r)};n.slice(0,4).forEach(r=>{l(r.device_id),l(i(r.device_id))}),l(e),l(i(e));for(let r of o)try{let b=await ae(r);if(b&&b.online)return{device_id:r,device_type:b.device_type||a[r]||a[i(r)]||"cyberpi"}}catch{}return null}var oe="fc_jwt";function pe(){try{return localStorage.getItem(oe)}catch{return null}}async function Ue(e,t){let a=await fetch(`${O}/api/auth/login`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({username:e,password:t})});if(!a.ok){let s=new Error("login failed");throw s.status=a.status,s}let n=await a.json().catch(()=>({}));return n.token||n.jwt||n.access_token||null}async function Fe(e){try{let t=await fetch(`${O}/api/me`,{headers:{Authorization:`Bearer ${e}`},cache:"no-store"});return t.ok?await t.json().catch(()=>({})):null}catch{return null}}async function Oe(e){let t=await fetch(`${O}/api/admin/devices`,{headers:{Authorization:`Bearer ${e}`},cache:"no-store"});if(t.status===401){let n=new Error("unauthorized");throw n.status=401,n}if(!t.ok)return[];let a=await t.json().catch(()=>[]);return Array.isArray(a)?a:a.devices||[]}var je=e=>e.replace(/-r\\d+$/,"");function Ne(e){let t=new Map;for(let n of e){let s=n.device_id||n.id;if(!s)continue;let i=je(s),o=t.get(i);o||(o={base:i,online:!1,lastSeen:0,telem:0,count:0,onlineId:null,reprId:s,reprLs:-1,deviceType:null},t.set(i,o)),o.count++,o.telem+=n.telemetry_count||0;let l=n.last_seen||n.last_seen_ms||0;l>o.lastSeen&&(o.lastSeen=l),n.online&&(o.online=!0,o.onlineId=s),l>=o.reprLs&&(o.reprLs=l,o.reprId=s,n.device_type&&(o.deviceType=n.device_type)),!o.deviceType&&n.device_type&&(o.deviceType=n.device_type)}let a=[...t.values()];return a.forEach(n=>{n.target=n.onlineId||n.base}),a.sort((n,s)=>(s.online?1:0)-(n.online?1:0)||s.lastSeen-n.lastSeen),a}async function me(){try{let e=await fetch(`${O}/api/microbit/relay.hex`);if(!e.ok)throw new Error(`Firmware not available (${e.status})`);let t=await e.blob(),n=await(await window.showSaveFilePicker({suggestedName:"relay.hex",startIn:"documents",types:[{description:"Firmware",accept:{"application/octet-stream":[".hex"]}}]})).createWritable();await n.write(t),await n.close()}catch(e){if(e.name==="AbortError")return;console.error("saveHexToMicrobit:",e);let t=document.createElement("a");t.href=`${O}/api/microbit/relay.hex`,t.download="relay.hex",t.click()}}async function He(e,t){let a=pe(),n={"content-type":"application/json"};a&&(n.Authorization=`Bearer ${a}`);let s=await fetch(`${O}/api/chat`,{method:"POST",headers:n,body:JSON.stringify({message:e,device_id:t})});if(!s.ok){let i=new Error("chat failed");throw i.status=s.status,i}return s.json().catch(()=>({}))}var Ge=["What just happened?","Is my device okay?","Show recent alerts."];function Ye(e){if(typeof e=="string")return e;if(!e)return"alert";let t=e.classification||e.mg?.classification||e.event||"alert",a=e.impact_g!=null?` \\xB7 ${e.impact_g}g`:"",n=e.ago?` \\xB7 ${e.ago}`:"";return`${t}${a}${n}`}function Ie(){let a=window.screenLeft??window.screenX??0,n=window.screenTop??window.screenY??0,s=window.innerWidth||document.documentElement.clientWidth||screen.width,i=window.innerHeight||document.documentElement.clientHeight||screen.height,o=Math.max(0,Math.round(a+(s-1020)/2)),l=Math.max(0,Math.round(n+(i-700)/2)),r=["popup=yes","width=1020","height=700",`left=${o}`,`top=${l}`,"location=no","menubar=no","toolbar=no","status=no","resizable=yes","scrollbars=yes"].join(",");return window.open(Re,"funconnect_mblock",r)}function De({current:e}){let t=we.findIndex(a=>a.key===e);return React.createElement("div",{className:"steps"},we.map((a,n)=>React.createElement("div",{key:a.key,className:"step "+(n===t?"active":n<t?"done":"")},React.createElement("span",{className:"dot"},n<t?"\\u2713":n+1),a.label)))}function G({state:e,label:t}){return React.createElement("span",{className:"pill "+(e==="ok"?"ok":e==="bad"?"bad":e==="wait"?"wait":"")},React.createElement("span",{className:"led"}),t)}function ke(e){return e==null?"\\u2014":e<5?"just now":e<60?`${e}s ago`:e<3600?`${Math.round(e/60)}m ago`:e<86400?`${Math.round(e/3600)}h ago`:`${Math.round(e/86400)}d ago`}function Ve(){let e=W(null);return B(()=>{let t=e.current;if(!t)return;let a=t.getContext("2d"),n=window.devicePixelRatio||1,s=()=>{t.width=window.innerWidth*n,t.height=window.innerHeight*n};s();let i=["#37e0a6","#2bb3ff","#ffb454","#ff6b6b","#ffffff"],o=Array.from({length:170},()=>({x:window.innerWidth/2*n,y:window.innerHeight*.34*n,vx:(Math.random()-.5)*15*n,vy:(Math.random()*-13-4)*n,g:.36*n,s:(4+Math.random()*6)*n,rot:Math.random()*6.28,vr:(Math.random()-.5)*.32,c:i[Math.random()*i.length|0]})),l,r=performance.now(),b=v=>{let p=v-r;a.clearRect(0,0,t.width,t.height);for(let c of o)c.vy+=c.g,c.x+=c.vx,c.y+=c.vy,c.rot+=c.vr,c.vx*=.99,a.save(),a.translate(c.x,c.y),a.rotate(c.rot),a.globalAlpha=Math.max(0,1-p/2600),a.fillStyle=c.c,a.fillRect(-c.s/2,-c.s/2,c.s,c.s*.6),a.restore();p<2600&&(l=requestAnimationFrame(b))};return l=requestAnimationFrame(b),window.addEventListener("resize",s),()=>{cancelAnimationFrame(l),window.removeEventListener("resize",s)}},[]),React.createElement("canvas",{ref:e,className:"confetti-canvas"})}function ve(){return React.createElement("svg",{width:"220",height:"120",viewBox:"0 0 220 120",fill:"none",xmlns:"http://www.w3.org/2000/svg"},React.createElement("rect",{x:"86",y:"20",width:"112",height:"80",rx:"12",fill:"#0e1420",stroke:"#2bb3ff",strokeWidth:"2"}),React.createElement("rect",{x:"98",y:"32",width:"88",height:"46",rx:"6",fill:"#0a0e14",stroke:"#26303f"}),React.createElement("circle",{cx:"112",cy:"55",r:"7",fill:"#37e0a6"}),React.createElement("circle",{cx:"132",cy:"55",r:"7",fill:"#2bb3ff"}),React.createElement("circle",{cx:"152",cy:"55",r:"7",fill:"#ffb454"}),React.createElement("rect",{x:"104",y:"86",width:"76",height:"6",rx:"3",fill:"#26303f"}),React.createElement("rect",{x:"10",y:"52",width:"30",height:"16",rx:"3",fill:"#1a1f2e",stroke:"#37e0a6",strokeWidth:"2"}),React.createElement("line",{x1:"40",y1:"60",x2:"86",y2:"60",stroke:"#37e0a6",strokeWidth:"3",strokeDasharray:"5 4"}),React.createElement("path",{d:"M78 55l10 5-10 5z",fill:"#37e0a6"}))}function Je({agent:e,onSelect:t}){let[a,n]=u(!0);B(()=>{let i=!0;(async()=>{let r=await be();i&&n(!1)})();let l=setTimeout(()=>{i&&n(!1)},2e3);return()=>{i=!1,clearTimeout(l)}},[]);let s=Object.values(H);return React.createElement("div",{className:"card"},React.createElement("h2",null,"Connect a Device"),React.createElement("p",{className:"lead"},"Choose the device you\'re connecting. We\'ll guide you through setup \\u2014 no brokers, no config files, no manual setup."),a&&React.createElement("p",{className:"muted",style:{marginBottom:18}},React.createElement("span",{className:"spinner"})," Looking for devices\\u2026"),React.createElement("div",{className:"grid cols-2",style:{marginBottom:18}},s.map(i=>{let o=!a&&e&&i.id==="cyberpi";return React.createElement("button",{key:i.id,className:"device-card",onClick:()=>t(i.id),style:{display:"flex",flexDirection:"column",gap:10,padding:20,background:o?"rgba(55,224,166,.06)":"var(--panel-2)",border:o?"1px solid var(--brand)":"1px solid var(--line)",borderRadius:14,cursor:"pointer",textAlign:"left",transition:"border-color .15s ease, background .15s ease"},onMouseEnter:l=>{o||(l.currentTarget.style.borderColor="var(--brand)")},onMouseLeave:l=>{o||(l.currentTarget.style.borderColor="var(--line)")}},React.createElement("div",{className:"between"},React.createElement("h3",{style:{margin:0}},i.name),o&&React.createElement("span",{className:"pill ok"},"Detected")),React.createElement("p",{className:"muted",style:{margin:0,fontSize:14}},i.description),React.createElement("div",{className:"row",style:{justifyContent:"space-between",alignItems:"center"}},React.createElement("span",{className:"tag"},i.connection.method," \\xB7 ",i.connection.tool),React.createElement("span",{style:{color:"var(--brand)",fontSize:14,fontWeight:650}},"Select \\u2192")))})))}function qe({agent:e,onStart:t,onViewDashboard:a}){return React.createElement("div",{className:"card"},React.createElement("h2",null,"Turn Your CyberPi Into a Live Device"),React.createElement("p",{className:"lead"},"Pick a program, flash it to your CyberPi, and watch its sensors stream live \\u2014 no brokers, no config files, no manual setup. It takes about a minute."),React.createElement("div",{className:"grid cols-2",style:{marginBottom:18}},React.createElement("div",{className:"stat"},React.createElement("div",{className:"k"},"What you need"),React.createElement("div",{className:"v",style:{fontSize:16}},"A CyberPi + USB cable"),React.createElement("p",{className:"muted",style:{marginTop:8}},"Plus ",React.createElement("b",null,"mLink2"),", the free helper that lets mBlock talk to your board."," ",React.createElement("a",{href:ge,target:"_blank",rel:"noreferrer"},"Get mLink2 \\u2197"))),React.createElement("div",{className:"stat"},React.createElement("div",{className:"k"},"Upload method"),React.createElement("div",{className:"v",style:{fontSize:16}},e?"Fast Deploy":"Guided (mBlock)"),React.createElement("p",{className:"muted",style:{marginTop:8}},e?"FunConnect agent detected \\u2014 we\'ll flash your board in one click, no popup.":"We\'ll open the mBlock editor in a focused window and guide you through the upload."))),React.createElement("div",{className:"row",style:{marginBottom:18}},e?React.createElement(G,{state:"ok",label:"FunConnect Agent Detected"}):React.createElement(G,{state:"wait",label:"Guided Upload Mode"})),React.createElement("hr",{className:"hr"}),React.createElement("div",{className:"between"},React.createElement("button",{className:"btn ghost",onClick:a},"View Dashboard \\u2192"),React.createElement("button",{className:"btn",onClick:t},"Get Started \\u2192")))}function _e({deviceType:e,selected:t,onSelect:a,onDeploy:n,onSkip:s}){let[i,o]=u(null),[l,r]=u(null);B(()=>{let c=!0;return We().then(m=>c&&o(m)).catch(m=>c&&r(m.message)),()=>{c=!1}},[]);let b=e?H[e]:null,v=b&&i?i.filter(c=>c.tags&&c.tags.includes(b.catalogTag)):i,p=b?`Programs for ${b.name}`:"Pick a Program";return React.createElement("div",{className:"card"},React.createElement("h2",null,p),React.createElement("p",{className:"lead"},"These run on your ",b?b.name:"device",". Choose one, then deploy \\u2014 we\'ll walk you through it."),l&&React.createElement("p",{className:"err"},"Couldn\'t load the catalog: ",l),!i&&!l&&React.createElement("p",{className:"muted"},React.createElement("span",{className:"spinner"})," Loading programs\\u2026"),i&&v&&v.length===0&&React.createElement("p",{className:"muted",style:{marginBottom:14}},"No programs available for this device yet."),v&&React.createElement("div",{className:"catalog"},v.map(c=>React.createElement("div",{key:c.id,className:"prog "+(t?.id===c.id?"selected":""),onClick:()=>a(c),onDoubleClick:()=>{a(c),n()}},React.createElement("h3",null,c.name," ",React.createElement("span",{className:"ver"},"v",c.version)),React.createElement("p",null,c.description),Array.isArray(c.tags)&&c.tags.length>0&&React.createElement("div",{className:"tags"},c.tags.map(m=>React.createElement("span",{key:m,className:"tag"},m)))))),React.createElement("hr",{className:"hr"}),React.createElement("div",{className:"between"},React.createElement("span",{className:"muted"},t?React.createElement(React.Fragment,null,"Selected: ",React.createElement("b",null,t.name)):"Nothing selected yet"),React.createElement("div",{className:"row"},React.createElement("button",{className:"btn ghost",onClick:s},"Skip to Dashboard \\u2192"),React.createElement("button",{className:"btn",disabled:!t,onClick:n},"Deploy \\u2192"))))}function Ae({deviceType:e,program:t,deviceId:a,setDeviceId:n,agent:s,onLive:i,onCancel:o,toast:l}){let[r,b]=u(0),[v,p]=u(null),[c,m]=u(null),[_,D]=u(!1),[f,w]=u(!1),k=W(null),x=W(!1);B(()=>{let C=!0;return Be(t.id).then(A=>C&&p(A)).catch(()=>{}),()=>{C=!1}},[t.id]),B(()=>{s&&fetch(`${O}/api/device/${encodeURIComponent(a)}/deploy`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({program_id:t.id})}).catch(()=>{})},[s,a,t.id]),B(()=>{if(!s&&r<2)return;let C=!0,A=async()=>{try{let L=await ae(a);if(!C)return;if(m(L),L.online&&!x.current){x.current=!0,D(!0);try{k.current&&!k.current.closed&&k.current.close()}catch{}setTimeout(()=>C&&i(),2600)}}catch{}};A();let $=setInterval(A,5e3);return()=>{C=!1,clearInterval($)}},[s,r,a,i]),B(()=>{if(!f)return;let C=setInterval(()=>{k.current&&k.current.closed&&(w(!1),clearInterval(C))},1e3);return()=>clearInterval(C)},[f]);let R=()=>{let C=Ie();if(!C){l("Your browser blocked the window \\u2014 allow pop-ups for this site, then try again.");return}k.current=C,w(!0),b(2);try{C.focus()}catch{}},E=async()=>{try{await navigator.clipboard.writeText(v||""),l("Code copied \\u2014 paste it into mBlock.")}catch{l("Couldn\'t auto-copy \\u2014 use the Download button instead.")}},Y=()=>{let C=new Blob([v||""],{type:"text/x-python"}),A=URL.createObjectURL(C),$=document.createElement("a");$.href=A,$.download=`${t.id}.py`,$.click(),URL.revokeObjectURL(A)};return _?React.createElement("div",{className:"overlay-full"},React.createElement("div",{className:"modal connected-screen"},React.createElement("div",{className:"ring-xl"},"\\u2713"),React.createElement("h2",{style:{fontSize:24,margin:"6px 0"}},"Your Device Is Online"),React.createElement("p",{className:"muted",style:{fontSize:16}},React.createElement("b",null,a)," is connected and streaming. Taking you to the live dashboard\\u2026"))):s?React.createElement(Se,{program:t,onCancel:o,sub:2,labels:["Connect","Deploy","Go live"]},React.createElement("div",{className:"substep",style:{textAlign:"center"}},React.createElement("div",{className:"illus"},React.createElement(ve,null)),React.createElement("h3",null,"Deploying to Your CyberPi"),React.createElement("p",null,"The FunConnect agent is flashing ",React.createElement("b",null,t.name)," \\u2014 no popup needed. Keep this page open."),React.createElement("div",{className:"pulsebar"},React.createElement("span",{className:"pulsedot"})," Upload in Progress\\u2026"),React.createElement("div",{className:"waiting"},React.createElement("span",{className:"spinner"})," Waiting for ",React.createElement("b",null,"\\xA0",a,"\\xA0")," to come online",c&&React.createElement("span",{className:"muted"}," \\xB7 ",c.telemetry_count??0," packets")))):React.createElement(Se,{program:t,onCancel:o,sub:r,labels:["Connect","Open mBlock","Upload"]},r===0&&React.createElement("div",{className:"substep"},React.createElement("div",{className:"illus"},React.createElement(ve,null)),React.createElement("h3",null,"Connect Your CyberPi"),React.createElement("p",null,"Plug your CyberPi into this computer with the USB cable and switch it on. Make sure",React.createElement("b",null," mLink2")," is installed so mBlock can see it. ",React.createElement("a",{href:ge,target:"_blank",rel:"noreferrer"},"Get mLink2 \\u2197")),React.createElement("button",{className:"btn lg",onClick:()=>b(1)},"My CyberPi Is Plugged In \\u2192")),r===1&&React.createElement("div",{className:"substep"},React.createElement("h3",null,"Open mBlock"),React.createElement("p",null,"We\'ll open the mBlock editor in a focused window. You\'ll upload your program there, then come straight back \\u2014 this page keeps waiting for your device."),React.createElement("div",{style:{marginBottom:18}},React.createElement("label",{className:"lbl"},"Device name \\u2014 this is how your dashboard finds the board"),React.createElement("input",{type:"text",value:a,onChange:C=>n(C.target.value)}),React.createElement("p",{className:"muted",style:{fontSize:13,marginTop:6}},"Default is ",React.createElement("b",null,"cyberpi"),". Leave it unless you renamed the device.")),React.createElement("button",{className:"btn lg",onClick:R},"Open mBlock \\u2192"),React.createElement("button",{className:"btn ghost block",style:{marginTop:10},onClick:()=>b(0)},"\\u2190 Back")),r===2&&React.createElement("div",{className:"substep"},React.createElement("div",{className:"pulsebar"},React.createElement("span",{className:"pulsedot"})," Upload in Progress \\u2014 finish in the mBlock window"),React.createElement("h3",null,"Upload Your Program"),React.createElement("p",{style:{marginBottom:14}},"In the mBlock window, do these three things:"),React.createElement("div",{className:"mini"},React.createElement("div",{className:"m"},React.createElement("span",{className:"mn"},"1"),React.createElement("div",null,"Switch mBlock to ",React.createElement("b",null,"Python")," mode (top-right toggle).")),React.createElement("div",{className:"m"},React.createElement("span",{className:"mn"},"2"),React.createElement("div",null,"Clear the editor and ",React.createElement("b",null,"paste your program"),".",React.createElement("div",{className:"row",style:{marginTop:8}},React.createElement("button",{className:"btn sm",onClick:E,disabled:!v},"Copy Code"),React.createElement("button",{className:"btn sm ghost",onClick:Y,disabled:!v},"Download .py")))),React.createElement("div",{className:"m"},React.createElement("span",{className:"mn"},"3"),React.createElement("div",null,"Click ",React.createElement("b",null,"Upload")," (not Run). Your board reboots and connects."))),React.createElement("div",{className:"waiting"},React.createElement("span",{className:"spinner"})," Waiting for ",React.createElement("b",null,"\\xA0",a,"\\xA0")," to come online",c&&React.createElement("span",{className:"muted"}," \\xB7 ",c.telemetry_count??0," packets")),!f&&React.createElement("button",{className:"btn ghost block",style:{marginTop:14},onClick:R},"Reopen mBlock Window")))}function Se({program:e,onCancel:t,sub:a,labels:n,children:s}){return React.createElement("div",{className:"overlay-full"},React.createElement("div",{className:"modal"},React.createElement("div",{className:"modal-head"},React.createElement("div",null,React.createElement("div",{className:"eyebrow"},"Deploy"),React.createElement("h2",{style:{margin:0,fontSize:20}},e.name)),React.createElement("button",{className:"x",onClick:t,"aria-label":"Cancel deploy"},"\\u2715")),React.createElement("div",{className:"progress-dots"},n.map((i,o)=>React.createElement("span",{key:i,className:"dot-lg "+(o===a?"active":o<a?"done":"")},o<a?"\\u2713":o+1)),React.createElement("span",{className:"stepcount"},"Step ",Math.min(a+1,n.length)," of ",n.length)),s))}var X={crash:{fg:"#ff6b6b",bg:"rgba(255,107,107,.14)",br:"rgba(255,107,107,.5)"},bump:{fg:"#ffb454",bg:"rgba(255,180,84,.14)",br:"rgba(255,180,84,.5)"},tilt:{fg:"#ffd54a",bg:"rgba(255,213,74,.14)",br:"rgba(255,213,74,.5)"},freefall:{fg:"#b98cff",bg:"rgba(185,140,255,.16)",br:"rgba(185,140,255,.5)"},vibration:{fg:"#2bb3ff",bg:"rgba(43,179,255,.14)",br:"rgba(43,179,255,.5)"},unknown:{fg:"#8a99ad",bg:"rgba(138,153,173,.14)",br:"rgba(138,153,173,.45)"}};function Ke(e){let t=e.madgwick_json??e.madgwick??null;if(typeof t=="string")try{t=JSON.parse(t)}catch{t=null}return{id:e.id??e.do_ms??e.doTs??`${e.signature}-${e.accel_peak}`,ts:e.do_ms??e.doTs??Date.now(),event:e.event??null,accel_peak:e.accel_peak??null,omega_peak:e.omega_peak??null,signature:e.signature??null,mg:t}}function Xe({classification:e}){let t=(e||"unknown").toLowerCase(),a=X[t]||X.unknown;return React.createElement("span",{className:"class-badge",style:{color:a.fg,background:a.bg,borderColor:a.br}},React.createElement("span",{className:"cbdot",style:{background:a.fg}}),t)}function xe({label:e,value:t}){let a=Number(t)||0,n=50+Math.max(-90,Math.min(90,a))/90*50;return React.createElement("div",{className:"gauge"},React.createElement("div",{className:"gauge-top"},React.createElement("span",null,e),React.createElement("b",null,a.toFixed(1),"\\xB0")),React.createElement("div",{className:"gauge-track"},React.createElement("span",{className:"gauge-zero"}),React.createElement("span",{className:"gauge-fill",style:{left:`${Math.min(50,n)}%`,width:`${Math.abs(n-50)}%`}})))}function Ze({alert:e}){if(!e)return null;let{mg:t}=e,a=t&&t.a_trans?Math.sqrt((t.a_trans.x||0)**2+(t.a_trans.y||0)**2+(t.a_trans.z||0)**2):null;return React.createElement("div",{className:"alert-detail"},t?React.createElement(React.Fragment,null,React.createElement("div",{className:"between",style:{marginBottom:14}},React.createElement(Xe,{classification:t.classification}),t.freefall&&React.createElement("span",{className:"class-badge",style:{color:X.freefall.fg,background:X.freefall.bg,borderColor:X.freefall.br}},"free-fall")),React.createElement("div",{className:"grid cols-2",style:{marginBottom:14}},React.createElement("div",{className:"stat"},React.createElement("div",{className:"k"},"Impact"),React.createElement("div",{className:"v"},a===null?"\\u2014":a.toFixed(1),React.createElement("span",{className:"u"}," g"))),React.createElement("div",{className:"stat"},React.createElement("div",{className:"k"},"Signature"),React.createElement("div",{className:"v",style:{fontSize:20}},e.signature??"\\u2014"))),React.createElement(xe,{label:"Roll",value:t.roll}),React.createElement(xe,{label:"Pitch",value:t.pitch}),React.createElement("div",{className:"row",style:{marginTop:12,gap:16}},React.createElement("span",{className:"muted"},"Accel peak: ",React.createElement("b",null,e.accel_peak??"\\u2014")," g"),React.createElement("span",{className:"muted"},"Omega peak: ",React.createElement("b",null,e.omega_peak??"\\u2014")," \\xB0/s"))):React.createElement("div",{className:"row",style:{gap:10,color:"var(--muted)"}},React.createElement("span",{className:"spinner"})," Madgwick processing\\u2026 (this alert predates the upgrade or is still being analyzed)"))}function Qe({deviceId:e}){let[t,a]=u(!0),[n,s]=u([]),[i,o]=u(""),[l,r]=u(!1),b=W(null);B(()=>{b.current&&(b.current.scrollTop=b.current.scrollHeight)},[n,l,t]);let v=async p=>{let c=(p??i).trim();if(!(!c||l)){o(""),s(m=>[...m,{role:"user",text:c}]),r(!0);try{let m=await He(c,e),_=m.reply||m.answer||m.response||m.message||"I\'m not sure how to answer that.",D=m.context||m.sources||m.alerts||[];s(f=>[...f,{role:"bot",text:_,context:D}])}catch(m){let _=m.status===404?"The assistant isn\'t switched on yet \\u2014 check back soon!":"Sorry, I couldn\'t reach the assistant. Please try again.";s(D=>[...D,{role:"bot",text:_,error:!0}])}finally{r(!1)}}};return React.createElement("div",{className:"card"},React.createElement("div",{className:"between",style:{marginBottom:t?12:0}},React.createElement("h3",{style:{margin:0}},"Ask FunConnect"),React.createElement("button",{className:"btn ghost sm",onClick:()=>a(p=>!p)},t?"Hide":"Show")),t&&React.createElement("div",{className:"chat"},React.createElement("div",{className:"chat-log",ref:b},n.length===0&&React.createElement("div",{className:"msg bot"},"Hi! Ask me what happened, whether your device is okay, or to show recent alerts."),n.map((p,c)=>React.createElement("div",{key:c,className:"msg "+p.role+(p.error?" error":"")},p.text,p.role==="bot"&&!p.error&&(p.context&&p.context.length?React.createElement("div",{className:"chat-ctx"},p.context.map((m,_)=>React.createElement("span",{key:_,className:"cx"},Ye(m)))):React.createElement("div",{className:"chat-empty"},"No disturbances detected yet \\u2014 try shaking the device!")))),l&&React.createElement("div",{className:"msg bot"},React.createElement("span",{className:"typing"},React.createElement("i",null),React.createElement("i",null),React.createElement("i",null)))),React.createElement("div",{className:"suggest"},Ge.map(p=>React.createElement("button",{key:p,className:"btn ghost sm",disabled:l,onClick:()=>v(p)},p))),React.createElement("form",{className:"chat-input",onSubmit:p=>{p.preventDefault(),v()}},React.createElement("input",{type:"text",value:i,placeholder:"Ask about your device\\u2026",disabled:l,onChange:p=>o(p.target.value)}),React.createElement("button",{className:"btn",type:"submit",disabled:l||!i.trim()},"Send"))))}function Pe({deviceId:e,setDeviceId:t,follow:a=!0,showDeviceControls:n=!0,deviceType:s="cyberpi"}){let[i,o]=u(null),[l,r]=u(!1),[b,v]=u(!1),[p,c]=u(null),[m,_]=u(null),[D,f]=u([]),[w,k]=u(null),[x,R]=u(a),[E,Y]=u(null),C=W(null),[A,$]=u(!1),[L,V]=u({a:!1,b:!1}),[S,ce]=u("clear");B(()=>{let g;try{g=new BroadcastChannel("relay"),g.onmessage=T=>{T.data.type==="connected"&&$(!0),T.data.type==="disconnected"&&$(!1)}}catch{}return()=>{try{g&&g.close()}catch{}}},[]);let Z=x&&E&&E[0]?E[0]:null,U=Z?Z.device_id:e,ne=Z?Z.device_type:null,ie=ne||s,J=H[ie]||H.cyberpi,h=J.telemetry.dashboardPanel,d=React.createElement("div",{style:{position:"fixed",bottom:0,left:0,right:0,zIndex:99999,background:"#ff0",color:"#000",padding:"10px 14px",font:"bold 14px monospace",textAlign:"center",borderTop:"3px solid red"}},"\\u26A0\\uFE0F TRIPWIRE \\u2014 deviceType=",s||"null"," discoveredType=",ne||"null"," effectiveType=",ie||"null"," panel=",h||"null"," profileId=",J?.id||"null");B(()=>{if(!x)return;let g=!0,T=async()=>{let F=await $e(e);g&&F&&Y([F])};T();let j=setInterval(T,15e3);return()=>{g=!1,clearInterval(j)}},[x,e]),B(()=>{o(null),f([]),k(null);let g=!0,T,j=()=>{try{let F=new WebSocket(`${Te}/dashboard/${encodeURIComponent(U)}`);C.current=F,F.onopen=()=>g&&(r(!0),v(!0)),F.onmessage=Le=>{if(g)try{let q=JSON.parse(Le.data);if(q.type==="state"&&q.telemetry&&(o(q.telemetry),_(Date.now()),q.buttons&&V(q.buttons)),q.type==="alert"){let de=Ke(q);f(Me=>[de,...Me.filter(ze=>ze.id!==de.id)].slice(0,20)),k(de.id)}}catch{}},F.onclose=()=>{g&&(r(!1),v(!0),T=setTimeout(j,5e3))},F.onerror=()=>{try{F.close()}catch{}}}catch{v(!0)}};return j(),()=>{g=!1,clearTimeout(T);try{C.current?.close()}catch{}}},[U]),B(()=>{let g=!0,T=async()=>{try{let F=await ae(U);g&&c(F)}catch{}};T();let j=setInterval(T,5e3);return()=>{g=!1,clearInterval(j)}},[U]);let y=m&&Date.now()-m<6e4,N=p?.online||y,I=i?Number(i.tilt||0):0,Q=i?Number(i.vibration||0):0,M=(g,T=2)=>g==null||isNaN(g)?"\\u2014":Number(g).toFixed(T),se=m||p?.last_seen_ms||null,re=se?Math.max(0,Math.round((Date.now()-se)/1e3)):null,P=D.find(g=>g.id===w)||D[0]||null,ee=g=>ke(Math.max(0,Math.round((Date.now()-g)/1e3)));return React.createElement("div",{className:"grid"},d,React.createElement("div",{className:"card"},React.createElement("div",{className:"between",style:{flexWrap:"wrap",gap:12}},React.createElement("div",null,React.createElement("h2",{style:{marginBottom:6}},"Live Dashboard"),React.createElement("div",{className:"row",style:{gap:8,alignItems:"center"}},React.createElement("span",{className:"muted",style:{fontSize:13}},"Device"),n?React.createElement(React.Fragment,null,React.createElement("input",{className:"dev-input",type:"text",value:U,spellCheck:!1,onChange:g=>{R(!1),t&&t(g.target.value)}}),React.createElement("button",{className:"btn sm ghost",onClick:()=>R(!0),disabled:x},"Auto")):React.createElement("b",{style:{fontFamily:"ui-monospace, Menlo, monospace",fontSize:13}},U))),React.createElement("div",{className:"row"},n&&React.createElement(G,{state:x&&E?"ok":"wait",label:x?E?"Auto-following":"Auto \\xB7 discovery pending":"Manual"}),React.createElement(G,{state:N?"ok":"bad",label:N?"Device Online":"Offline"}),React.createElement(G,{state:l?"ok":"wait",label:l?"Live Stream Connected":"Live Stream Pending"}),A&&React.createElement(G,{state:"ok",label:"USB Relay Active"}))),!l&&b&&React.createElement("p",{className:"muted",style:{marginTop:10,fontSize:12.5}},"Live stream disconnected \\u2014 showing polled health and retrying. IMU gauges resume the moment a device streams ",React.createElement("code",null,"state")," frames.")),h==="imu"&&React.createElement(React.Fragment,null,React.createElement("div",{className:"grid cols-2"},React.createElement("div",{className:"card"},React.createElement("h3",{style:{marginBottom:12}},"Orientation"),React.createElement("div",{className:"tiltbox"},React.createElement("div",{className:"horizon"},React.createElement("div",{className:"plane",style:{transform:`rotate(${Math.max(-60,Math.min(60,I))}deg)`}}))),React.createElement("div",{className:"row",style:{marginTop:12,justifyContent:"space-between"}},React.createElement("div",{className:"stat",style:{flex:1}},React.createElement("div",{className:"k"},"Tilt"),React.createElement("div",{className:"v"},M(I,1),React.createElement("span",{className:"u"},"\\xB0"))),React.createElement("div",{className:"stat",style:{flex:1}},React.createElement("div",{className:"k"},"Vibration"),React.createElement("div",{className:"v"},M(Q,2))))),React.createElement("div",{className:"card"},React.createElement("h3",{style:{marginBottom:12}},"Motion (IMU)"),React.createElement("div",{className:"grid",style:{gridTemplateColumns:"1fr 1fr 1fr",gap:10}},[["acc_x","Acc X"],["acc_y","Acc Y"],["acc_z","Acc Z"],["gyro_x","Gyro X"],["gyro_y","Gyro Y"],["gyro_z","Gyro Z"]].map(([g,T])=>React.createElement("div",{className:"stat",key:g},React.createElement("div",{className:"k"},T),React.createElement("div",{className:"v",style:{fontSize:20}},M(i?.[g],2))))))),React.createElement("div",{className:"grid cols-2"},React.createElement("div",{className:"stat"},React.createElement("div",{className:"k"},"Telemetry packets"),React.createElement("div",{className:"v"},p?.telemetry_count??"\\u2014")),React.createElement("div",{className:"stat"},React.createElement("div",{className:"k"},"Last seen"),React.createElement("div",{className:"v",style:{fontSize:20}},ke(re)),m&&React.createElement("div",{className:"u",style:{marginTop:4}},"live frame received"))),React.createElement("div",{className:"card"},React.createElement("div",{className:"between",style:{marginBottom:12}},React.createElement("h3",{style:{margin:0}},"Disturbance Alerts"),React.createElement("span",{className:"muted",style:{fontSize:13}},D.length?`${D.length} recent`:"live")),D.length===0?React.createElement("p",{className:"muted",style:{margin:0}},"No alerts yet \\u2014 shake the device to trigger one."):React.createElement("div",{className:"alert-layout"},React.createElement("div",{className:"alert-list"},D.map(g=>{let T=(g.mg?.classification||"unknown").toLowerCase(),j=X[T]||X.unknown;return React.createElement("button",{key:g.id,className:"alert-row "+(P?.id===g.id?"sel":""),onClick:()=>k(g.id)},React.createElement("span",{className:"ar-dot",style:{background:g.mg?j.fg:"var(--muted)"}}),React.createElement("span",{className:"ar-cls"},g.mg?T:"processing"),React.createElement("span",{className:"ar-meta"},g.accel_peak!=null?`${g.accel_peak}g`:"\\u2014"),React.createElement("span",{className:"ar-time"},ee(g.ts)))})),React.createElement(Ze,{alert:P})))),h==="microbit"&&React.createElement(React.Fragment,null,React.createElement("div",{className:"card"},React.createElement("h3",{style:{marginBottom:12}},"LED Matrix"),React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(5, 28px)",gap:4,justifyContent:"center",marginBottom:14}},(ye[S]||ye.clear).map((g,T)=>React.createElement("div",{key:T,style:{width:24,height:24,borderRadius:"50%",background:g?"var(--brand)":"var(--line)",boxShadow:g?"0 0 8px var(--brand)":"none",transition:"background .15s, box-shadow .15s"}}))),React.createElement("div",{className:"row",style:{gap:8,justifyContent:"center",flexWrap:"wrap"}},[{pattern:"heart",label:"\\u2764\\uFE0F Heart"},{pattern:"smile",label:"\\u{1F60A} Smile"},{pattern:"sad",label:"\\u{1F622} Sad"},{pattern:"star",label:"\\u2B50 Star"},{pattern:"clear",label:"\\u{1F5D1}\\uFE0F Clear"}].map(({pattern:g,label:T})=>React.createElement("button",{key:g,className:"btn sm",onClick:()=>{ce(g),he(JSON.stringify({command:"led_matrix",pattern:g}))},style:{fontSize:13,padding:"6px 12px"}},T)))),React.createElement("div",{className:"grid cols-2"},React.createElement("div",{className:"card"},React.createElement("h3",{style:{marginBottom:12}},"Buttons"),React.createElement("div",{className:"row",style:{gap:16}},React.createElement("div",null,React.createElement("div",{className:"muted",style:{fontSize:12,marginBottom:4}},"Button A"),React.createElement(G,{state:L.a?"ok":"muted",label:L.a?"pressed":"released"})),React.createElement("div",null,React.createElement("div",{className:"muted",style:{fontSize:12,marginBottom:4}},"Button B"),React.createElement(G,{state:L.b?"ok":"muted",label:L.b?"pressed":"released"})))),React.createElement("div",{className:"card"},React.createElement("h3",{style:{marginBottom:12}},"Temperature"),(()=>{let g=i?.temp!=null?Number(i.temp):null;if(g===null)return React.createElement("span",{className:"muted"},"\\u2014");let j=240-Math.max(0,Math.min(100,(g-10)/30*100))/100*240;return React.createElement("div",null,React.createElement("div",{style:{height:10,borderRadius:5,background:"linear-gradient(90deg, var(--brand-2), var(--bad))",marginBottom:6}}),React.createElement("div",{style:{display:"flex",justifyContent:"space-between",fontSize:13}},React.createElement("span",{style:{color:`hsl(${j}, 70%, 55%)`,fontWeight:650}},g,"\\xB0C"),React.createElement("span",{className:"muted"},"10\\u201340\\xB0C")))})())),React.createElement("div",{className:"card"},React.createElement("h3",{style:{marginBottom:12}},"Accelerometer"),React.createElement("div",{className:"grid cols-3",style:{textAlign:"center"}},["acc_x","acc_y","acc_z"].map(g=>React.createElement("div",{key:g},React.createElement("div",{className:"muted",style:{fontSize:12,marginBottom:4}},g),React.createElement("div",{style:{fontSize:16,fontWeight:650}},M(i?.[g],1)),React.createElement("div",{className:"muted",style:{fontSize:11}},"mg")))))),h==="placeholder"&&React.createElement("div",{className:"card",style:{textAlign:"center",padding:40}},React.createElement("h3",{style:{marginBottom:8}},J.name," Dashboard"),React.createElement("p",{className:"muted",style:{margin:0}},J.name," support is coming soon. Live telemetry, LED matrix controls, and button events will appear here once the ",J.name," transport is live.")),React.createElement(Qe,{deviceId:U}))}function et(){let[e,t]=u("detect"),[a,n]=u(null),[s,i]=u(null),[o,l]=u(!1),[r,b]=u(()=>{try{return localStorage.getItem("fc_device_id")||K}catch{return K}}),[v,p]=u(null),c=W(0),m=te(f=>{let w=(f||"").trim()||K;b(w);try{localStorage.setItem("fc_device_id",w)}catch{}},[]),_=te(f=>{p(f),clearTimeout(c.current),c.current=setTimeout(()=>p(null),3200)},[]);return B(()=>{be().then(l)},[]),React.createElement("div",{className:"wrap"},e!=="deploy"&&React.createElement(React.Fragment,null,React.createElement("div",{className:"brandbar"},React.createElement("div",{className:"logo"},"F"),React.createElement("div",{style:{flex:1}},React.createElement("h1",null,"FunConnect"),React.createElement("div",{className:"sub"},"Plug in a CyberPi \\xB7 Pick a program \\xB7 Watch it live")),React.createElement("a",{className:"btn ghost sm",href:"#login",style:{textDecoration:"none"}},"Admin \\u2192")),React.createElement(De,{current:e})),e==="detect"&&React.createElement(Je,{agent:o,onSelect:f=>{n(f),t("catalog")}}),e==="catalog"&&React.createElement(_e,{deviceType:a,selected:s,onSelect:i,onDeploy:()=>s&&t("deploy"),onSkip:()=>t("dashboard")}),e==="deploy"&&React.createElement(Ae,{deviceType:a,program:s,deviceId:r,setDeviceId:m,agent:o,onLive:()=>t("dashboard"),onCancel:()=>t("catalog"),toast:_}),e==="dashboard"&&React.createElement(Pe,{deviceType:a,deviceId:r,setDeviceId:m}),(e==="catalog"||e==="dashboard")&&React.createElement("div",{style:{marginTop:16}},React.createElement("button",{className:"btn ghost sm",onClick:()=>t(e==="dashboard"?"catalog":"detect")},e==="dashboard"?"\\u2190 Back to Catalog":"\\u2190 Back")),v&&React.createElement("div",{className:"toast"},v))}function le(){return React.createElement("div",{className:"splash"},React.createElement("div",{className:"logo lg"},"F"),React.createElement("div",{className:"spinner"}))}function tt({onSuccess:e}){let[t,a]=u(""),[n,s]=u(""),[i,o]=u(null),[l,r]=u(!1);return React.createElement("div",{className:"auth-wrap"},React.createElement("form",{className:"auth-card",onSubmit:async v=>{v.preventDefault(),r(!0),o(null);try{let p=await Ue(t.trim(),n);if(!p){o("Server didn\'t return a token."),r(!1);return}try{localStorage.setItem(oe,p)}catch{}e(p)}catch(p){o(p.status===401?"Invalid username or password.":`Login failed${p.status?` (${p.status})`:""}. Try again.`),r(!1)}}},React.createElement("div",{className:"brandbar",style:{justifyContent:"center",marginBottom:20}},React.createElement("div",{className:"logo"},"F"),React.createElement("div",null,React.createElement("h1",null,"FunConnect"),React.createElement("div",{className:"sub"},"Admin sign in"))),React.createElement("label",{className:"lbl"},"Username"),React.createElement("input",{type:"text",value:t,autoFocus:!0,autoComplete:"username",onChange:v=>a(v.target.value)}),React.createElement("label",{className:"lbl",style:{marginTop:12}},"Password"),React.createElement("input",{type:"password",value:n,autoComplete:"current-password",onChange:v=>s(v.target.value)}),i&&React.createElement("p",{className:"err",style:{marginTop:12}},i),React.createElement("button",{className:"btn lg",type:"submit",disabled:l||!t||!n,style:{marginTop:18}},l?React.createElement(React.Fragment,null,React.createElement("span",{className:"spinner"})," Signing in\\u2026"):"Login")))}function at({onDeviceReady:e}){let[t,a]=u(0),n=(h,d,y,N)=>React.createElement("div",{style:{position:"fixed",top:0,left:0,right:0,zIndex:99998,background:"#ff0",color:"#000",padding:"6px 10px",font:"bold 12px monospace",textAlign:"center",borderBottom:"3px solid red"}},"\\u26A0\\uFE0F CW sub=",h," deviceType=",d||"null"," deviceId=",y||"null"," transport=",N||"null"),[s,i]=u(null),[o,l]=u(K),[r,b]=u(null),[v,p]=u(null),[c,m]=u(!1),[_,D]=u(!1),[f,w]=u(null),[k,x]=u(""),[R,E]=u(null),[Y,C]=u(0),A=W(null),$=W(!1),L=W(null),V=W(null),S=s?H[s]:null;B(()=>{if(!s||s!=="cyberpi")return;let h=!0;return Be("hello-world").then(d=>h&&b(d)).catch(()=>{}),()=>{h=!1}},[s]),B(()=>{if(t<12||f==="serial")return;let h=!0,d=async()=>{try{let N=await ae(o);if(!h)return;if(p(N),N.online&&!$.current){$.current=!0,D(!0),a(4);try{A.current&&!A.current.closed&&A.current.close()}catch{}}}catch{}};d();let y=setInterval(d,5e3);return()=>{h=!1,clearInterval(y)}},[t,o,f]),B(()=>{if(!c)return;let h=setInterval(()=>{A.current&&A.current.closed&&(m(!1),clearInterval(h))},1e3);return()=>clearInterval(h)},[c]);let ce=h=>{i(h),l(H[h].defaultDeviceId);let d=H[h];if(console.log("selectDevice",h,"transports:",d.transports,"length:",d.transports?.length),d.transports&&d.transports.length>1)a(1);else if(d.transports&&d.transports.length===1&&d.transports[0].id==="serial"){let y=d.transports[0];y.deviceId&&l(y.deviceId),U(y.deviceId||d.defaultDeviceId)}else a(99)},Z=h=>{if(w(h),h==="serial"){let d=S.transports.find(y=>y.id==="serial");d&&d.deviceId&&l(d.deviceId),U(d?d.deviceId:o)}else{let d=S.transports.find(y=>y.id==="wifi");d&&d.deviceId&&l(d.deviceId),a(10)}},U=async h=>{E(null),C(0);let d,y;try{d=await navigator.serial.requestPort();let N=d.getInfo(),I=N.usbVendorId&&N.usbProductId?`0x${N.usbVendorId.toString(16).toUpperCase().padStart(4,"0")}:0x${N.usbProductId.toString(16).toUpperCase().padStart(4,"0")}`:null,M=I?{"0x0D28:0x0204":"microbit","0x0D28:0x0209":"microbit","0x1A86:0x7523":"cyberpi"}[I]:null;if(M&&M!==s){let P=H[M];i(M),l(P?P.defaultDeviceId:h),h=P?P.defaultDeviceId:h}a(20),x("connecting-serial"),await d.open({baudRate:115200}),x("connecting-wss"),y=new WebSocket(`${Te}/device/${encodeURIComponent(h)}`),await new Promise((P,ee)=>{y.onopen=P,y.onerror=()=>ee(new Error("WSS connection failed \\u2014 is the Worker deployed?"))}),x("connected-wss"),fe(d,y,h);let se=new BroadcastChannel("relay");se.onmessage=P=>{P.data.type==="first-byte"&&P.data.deviceId===h&&(x("receiving-data"),se.close())};let re=Date.now();V.current=setInterval(()=>{C(Math.round((Date.now()-re)/1e3))},1e3),x("polling"),L.current=setInterval(async()=>{let P=(Date.now()-re)/1e3;try{let ee=await ae(h);if(ee&&ee.online){clearInterval(L.current),clearInterval(V.current),D(!0),a(4);return}}catch{}P>30?(clearInterval(L.current),clearInterval(V.current),x("timeout")):P>15&&x("no-response")},2e3)}catch(N){console.error("Serial relay error:",N),E(N.message||"Could not connect."),x("");try{y&&y.close()}catch{}try{d&&d.close()}catch{}let I=H[s];a(I&&I.transports&&I.transports.length>1?1:0)}},ne=()=>{let h=Ie();if(h){A.current=h,m(!0),a(12);try{h.focus()}catch{}}},ie=async()=>{try{await navigator.clipboard.writeText(r||"")}catch{}},J=()=>{let h=new Blob([r||""],{type:"text/x-python"}),d=URL.createObjectURL(h),y=document.createElement("a");y.href=d,y.download="hello-world.py",y.click(),URL.revokeObjectURL(d)};if(t===4&&_)return React.createElement("div",null,n(t,s,o,f),React.createElement(Ve,null),React.createElement("div",{className:"card",style:{textAlign:"center",padding:32}},React.createElement("div",{className:"ring-xl"},"\\u2713"),React.createElement("h2",{style:{fontSize:22,margin:"10px 0 6px"}},"Device Connected"),React.createElement("p",{className:"muted",style:{fontSize:15,marginBottom:18}},React.createElement("b",null,o)," is online and streaming."),React.createElement("div",{style:{background:"#ff0",color:"#000",padding:"4px 8px",font:"bold 12px monospace",marginBottom:8}},"\\u26A0\\uFE0F CW success \\u2014 deviceType=",s||"null"," deviceId=",o||"null"),React.createElement("button",{className:"btn lg",onClick:()=>{console.log("onDeviceReady",s,o),e(s,o)},style:{maxWidth:300}},"View Live Dashboard \\u2192")));if(t===0){let h=Object.values(H);return React.createElement("div",{className:"card"},n(t,s,o,f),React.createElement("div",{style:{background:"#ff0",color:"#000",padding:"4px 8px",font:"bold 11px monospace",marginBottom:8}},"\\u26A0\\uFE0F CW sub=0 deviceType=",s||"null"," \\u2014 ",h.map(d=>`${d.id}:transports=${d.transports?.length||0}`).join(" ")),React.createElement("h2",null,"Connect a Device"),React.createElement("p",{className:"lead"},"Choose your device and we\'ll walk you through getting it online."),React.createElement("div",{className:"grid cols-2"},h.map(d=>React.createElement("button",{key:d.id,onClick:()=>ce(d.id),style:{display:"flex",flexDirection:"column",gap:10,padding:22,background:"var(--panel-2)",border:"1px solid var(--line)",color:"var(--ink)",borderRadius:14,cursor:"pointer",textAlign:"left",transition:"border-color .15s ease"},onMouseEnter:y=>{y.currentTarget.style.borderColor="var(--brand)"},onMouseLeave:y=>{y.currentTarget.style.borderColor="var(--line)"}},React.createElement("h3",{style:{margin:0,fontSize:17,color:"var(--ink)"}},d.name),React.createElement("p",{className:"muted",style:{margin:0,fontSize:13.5,lineHeight:1.5}},d.description),React.createElement("div",{className:"row",style:{justifyContent:"space-between",alignItems:"center"}},React.createElement("span",{className:"tag"},d.connection.method," \\xB7 ",d.connection.tool),React.createElement("span",{style:{color:"var(--brand)",fontSize:14,fontWeight:650}},"Set Up \\u2192"))))))}if(t===1&&S&&S.transports&&S.transports.length>1)return React.createElement("div",{className:"card"},React.createElement("div",{className:"between",style:{marginBottom:18}},React.createElement("div",null,React.createElement("div",{className:"eyebrow"},"Setting up ",S.name),React.createElement("h2",{style:{margin:0,fontSize:20}},"How is your ",S.name," connected?")),React.createElement("button",{className:"btn ghost sm",onClick:()=>{a(0),w(null)}},"\\u2190 Back")),React.createElement("div",{className:"grid cols-2"},S.transports.map(h=>React.createElement("button",{key:h.id,onClick:()=>Z(h.id),style:{display:"flex",flexDirection:"column",gap:10,padding:22,background:"var(--panel-2)",border:"1px solid var(--line)",color:"var(--ink)",borderRadius:14,cursor:"pointer",textAlign:"left",transition:"border-color .15s ease"},onMouseEnter:d=>{d.currentTarget.style.borderColor="var(--brand)"},onMouseLeave:d=>{d.currentTarget.style.borderColor="var(--line)"}},React.createElement("h3",{style:{margin:0,fontSize:17,color:"var(--ink)"}},h.label),React.createElement("p",{className:"muted",style:{margin:0,fontSize:13.5,lineHeight:1.5}},h.description),React.createElement("span",{style:{color:"var(--brand)",fontSize:14,fontWeight:650}},"Select \\u2192")))));if(t===20){let h=()=>{clearInterval(L.current),clearInterval(V.current),ue(),a(1),w(null)},d=()=>{clearInterval(L.current),clearInterval(V.current),E(null);let N=S?.transports?.find(I=>I.id==="serial");U(N?.deviceId||o)},y=s==="microbit";return React.createElement("div",{className:"card",style:{textAlign:"center",padding:32}},n(t,s,o,f),React.createElement("div",{className:"between",style:{marginBottom:18}},React.createElement("div",null,React.createElement("div",{className:"eyebrow"},"Setting up ",S?.name," \\xB7 USB"),React.createElement("h2",{style:{margin:0,fontSize:20}},"USB Relay")),React.createElement("button",{className:"btn ghost sm",onClick:h},"\\u2190 Back")),k==="connecting-serial"&&React.createElement("div",null,React.createElement("div",{className:"pulsebar"},React.createElement("span",{className:"pulsedot"})," Opening serial port\\u2026"),React.createElement("p",{className:"muted"},"Select your ",S?.name," in the browser dialog. It should appear as a COM port or serial device.")),k==="connecting-wss"&&React.createElement("div",null,React.createElement("div",{style:{fontSize:40,marginBottom:12}},"\\u2713"),React.createElement("div",{className:"pulsebar"},React.createElement("span",{className:"pulsedot"})," Connecting to FunConnect\\u2026"),React.createElement("p",{className:"muted"},"Serial port opened. Establishing secure WebSocket to the relay server.")),(k==="connected-wss"||k==="polling")&&React.createElement("div",null,React.createElement("div",{style:{fontSize:48,marginBottom:8,color:"var(--brand)"}},"\\u2713"),React.createElement("div",{className:"pulsebar",style:{borderColor:"rgba(55,224,166,.35)",background:"rgba(55,224,166,.07)"}},React.createElement("span",{className:"pulsedot",style:{background:"var(--brand)",boxShadow:"0 0 12px var(--brand)"}}),"Relay active \\u2014 waiting for hello from ",o,"\\u2026",Y>0&&React.createElement("span",{style:{marginLeft:8,fontSize:12,opacity:.7}},"(",Y,"s)")),React.createElement("p",{className:"muted",style:{fontSize:14}},React.createElement("b",null,o)," is connected via USB. Waiting for telemetry\\u2026")),k==="receiving-data"&&React.createElement("div",null,React.createElement("div",{style:{fontSize:48,marginBottom:8,color:"var(--brand)"}},"\\u2713"),React.createElement("div",{className:"pulsebar",style:{borderColor:"rgba(55,224,166,.35)",background:"rgba(55,224,166,.07)"}},React.createElement("span",{className:"pulsedot",style:{background:"var(--brand)",boxShadow:"0 0 12px var(--brand)"}}),"Receiving data from ",o,"\\u2026"),React.createElement("p",{className:"muted",style:{fontSize:14}},"Hardware is alive \\u2014 waiting for the server to register the device.")),k==="no-response"&&React.createElement("div",null,React.createElement("div",{style:{fontSize:48,marginBottom:8,color:"var(--warn)"}},"?"),React.createElement("div",{className:"pulsebar",style:{borderColor:"rgba(255,180,84,.35)",background:"rgba(255,180,84,.07)"}},React.createElement("span",{className:"pulsedot",style:{background:"var(--warn)",boxShadow:"0 0 12px var(--warn)"}}),"No response \\u2014 is the firmware flashed?"),React.createElement("p",{className:"muted",style:{fontSize:14,marginBottom:16}},"The relay is connected but no data has arrived from ",o," after ",Y,"s."),React.createElement("button",{className:"btn",onClick:()=>me()},"\\u2193 Download Firmware")),k==="timeout"&&React.createElement("div",null,React.createElement("div",{style:{fontSize:48,marginBottom:8,color:"var(--bad)"}},"\\u2715"),React.createElement("div",{className:"pulsebar",style:{borderColor:"rgba(255,107,107,.35)",background:"rgba(255,107,107,.07)"}},React.createElement("span",{className:"pulsedot",style:{background:"var(--bad)",boxShadow:"0 0 12px var(--bad)"}}),"Device not responding."),React.createElement("p",{className:"muted",style:{fontSize:14,marginBottom:16}},"No response from ",o," after 30 seconds."),React.createElement("div",{className:"row",style:{gap:10,justifyContent:"center"}},React.createElement("button",{className:"btn",onClick:()=>me()},"\\u2193 Download Firmware"),React.createElement("button",{className:"btn ghost",onClick:d},"Try Again"))),R&&React.createElement("div",{style:{background:"rgba(255,107,107,.12)",border:"1px solid var(--bad)",borderRadius:14,padding:24,marginTop:18,textAlign:"left"}},React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:10}},React.createElement("span",{style:{fontSize:20}},"!"),React.createElement("span",{style:{color:"var(--bad)",fontWeight:700,fontSize:16}},"Connection Failed")),React.createElement("p",{style:{color:"var(--ink)",margin:"0 0 16px",fontSize:14,lineHeight:1.5}},R),React.createElement("div",{style:{color:"var(--muted)",fontSize:13,marginBottom:6,fontWeight:650}},"Possible reasons:"),React.createElement("ul",{style:{color:"var(--muted)",fontSize:13,margin:"0 0 18px",paddingLeft:18,lineHeight:1.7}},(()=>{let N=(R||"").toLowerCase();if(y)return["The micro:bit may not have the relay firmware flashed \\u2014 download it below","Unplug and replug the micro:bit \\u2014 wait 5 seconds","Try Chrome or Edge if Opera is having trouble","The device was unplugged \\u2014 check the USB cable and wait 5 seconds"].map((Q,M)=>React.createElement("li",{key:M},Q));let I=[];return(N.includes("port")||N.includes("serial")||N.includes("busy"))&&(I.push("mBlock is still open \\u2014 close it and try again"),I.push("mLink2 is running \\u2014 quit from the system tray")),(N.includes("wss")||N.includes("websocket")||N.includes("worker"))&&I.push("The FunConnect Worker may be hibernating \\u2014 wait 5s and try again"),(N.includes("wss")||N.includes("websocket"))&&I.push("The device ID doesn\'t match the firmware \\u2014 check relay.py DEVICE_ID"),I.push("The device was unplugged \\u2014 check the USB cable and wait 5 seconds"),I.push("relay.py may not be flashed \\u2014 upload it via mBlock first"),I.map((Q,M)=>React.createElement("li",{key:M},Q))})()),React.createElement("div",{className:"row",style:{gap:10}},React.createElement("button",{className:"btn",onClick:d},"Try Again"),y?React.createElement("button",{className:"btn ghost",onClick:()=>me()},"Download Firmware \\u2192"):React.createElement("button",{className:"btn ghost",onClick:()=>{E(null),w("wifi");let N=S?.transports?.find(I=>I.id==="wifi");N?.deviceId&&l(N.deviceId),a(10)}},"Use WiFi Instead"))))}if(S&&S.id==="cyberpi"&&t>=10&&t<=12){let h=t-9;return React.createElement("div",{className:"card"},React.createElement("div",{className:"between",style:{marginBottom:18}},React.createElement("div",null,React.createElement("div",{className:"eyebrow"},"Setting up ",S.name," \\xB7 WiFi"),React.createElement("h2",{style:{margin:0,fontSize:20}},"Get Your Device Online")),React.createElement("button",{className:"btn ghost sm",onClick:()=>{a(1),w(null)}},"\\u2190 Back")),React.createElement("div",{className:"progress-dots",style:{marginBottom:22}},["Connect","Open mBlock","Upload"].map((d,y)=>React.createElement("span",{key:d,className:"dot-lg "+(y+1===h?"active":y+1<h?"done":"")},y+1<h?"\\u2713":y+1)),React.createElement("span",{className:"stepcount"},"Step ",Math.min(h,3)," of 3")),t===10&&React.createElement("div",{className:"substep"},React.createElement("div",{className:"illus"},React.createElement(ve,null)),React.createElement("h3",null,"Connect Your ",S.name),React.createElement("p",null,"Plug your ",S.name," into this computer with the USB cable and switch it on. Make sure ",React.createElement("b",null,"mLink2")," is installed so mBlock can see it."," ",React.createElement("a",{href:ge,target:"_blank",rel:"noreferrer"},"Get mLink2 \\u2197")),React.createElement("div",{style:{marginBottom:18}},React.createElement("label",{className:"lbl"},"Device name \\u2014 this is how your dashboard finds the board"),React.createElement("input",{type:"text",value:o,onChange:d=>l(d.target.value),style:{color:"var(--ink)",background:"var(--panel-2)"}}),React.createElement("p",{className:"muted",style:{fontSize:13,marginTop:6}},"Default is ",React.createElement("b",null,S.defaultDeviceId),". Leave it unless you renamed the device.")),React.createElement("div",{className:"between"},React.createElement("button",{className:"btn ghost",onClick:()=>{a(1),w(null)}},"\\u2190 Back"),React.createElement("button",{className:"btn lg",style:{width:"auto"},onClick:()=>a(11)},"My ",S.name," Is Plugged In \\u2192"))),t===11&&React.createElement("div",{className:"substep"},React.createElement("h3",null,"Open mBlock"),React.createElement("p",null,"We\'ll open the mBlock editor in a focused window. You\'ll upload a program there, then come straight back \\u2014 this page keeps waiting for your device."),React.createElement("button",{className:"btn lg",onClick:ne},"Open mBlock \\u2192"),React.createElement("button",{className:"btn ghost block",style:{marginTop:10},onClick:()=>a(10)},"\\u2190 Back")),t===12&&React.createElement("div",{className:"substep"},React.createElement("div",{className:"pulsebar"},React.createElement("span",{className:"pulsedot"})," Upload in Progress \\u2014 finish in the mBlock window"),React.createElement("h3",null,"Upload Your Program"),React.createElement("p",{style:{marginBottom:14}},"In the mBlock window, do these three things:"),React.createElement("div",{className:"mini"},React.createElement("div",{className:"m"},React.createElement("span",{className:"mn"},"1"),React.createElement("div",null,"Switch mBlock to ",React.createElement("b",null,"Python")," mode (top-right toggle).")),React.createElement("div",{className:"m"},React.createElement("span",{className:"mn"},"2"),React.createElement("div",null,"Clear the editor and ",React.createElement("b",null,"paste the connection program"),".",React.createElement("div",{className:"row",style:{marginTop:8}},React.createElement("button",{className:"btn sm",onClick:ie,disabled:!r},"Copy Code"),React.createElement("button",{className:"btn sm ghost",onClick:J,disabled:!r},"Download .py")))),React.createElement("div",{className:"m"},React.createElement("span",{className:"mn"},"3"),React.createElement("div",null,"Click ",React.createElement("b",null,"Upload")," (not Run). Your board reboots and connects."))),React.createElement("div",{className:"waiting"},React.createElement("span",{className:"spinner"})," Waiting for ",React.createElement("b",null,"\\xA0",o,"\\xA0")," to come online",v&&React.createElement("span",{className:"muted"}," \\xB7 ",v.telemetry_count??0," packets")),!c&&React.createElement("button",{className:"btn ghost block",style:{marginTop:14},onClick:ne},"Reopen mBlock Window")))}return React.createElement("div",{className:"card",style:{textAlign:"center",padding:40}},React.createElement("h3",{style:{marginBottom:8}},S?S.name:"Device"," Setup"),React.createElement("p",{className:"muted",style:{margin:0}},S?S.name:"This device"," support is coming soon."),React.createElement("button",{className:"btn ghost sm",style:{marginTop:14},onClick:()=>a(0)},"\\u2190 Back"))}function nt({me:e,token:t,onLogout:a}){let[n,s]=u("connect"),[i,o]=u("cyberpi"),[l,r]=u(()=>{try{return localStorage.getItem("fc_device_id")||K}catch{return K}}),[b,v]=u(null),p=W(0),c=te(f=>{let w=(f||"").trim()||K;r(w);try{localStorage.setItem("fc_device_id",w)}catch{}},[]),m=te(f=>{v(f),clearTimeout(p.current),p.current=setTimeout(()=>v(null),3200)},[]);return React.createElement("div",{style:{display:"flex",minHeight:"100vh"}},React.createElement("div",{style:{width:180,flexShrink:0,background:"var(--panel)",borderRight:"1px solid var(--line)",display:"flex",flexDirection:"column",padding:"20px 0"}},React.createElement("div",{style:{padding:"0 16px 16px",borderBottom:"1px solid var(--line)",marginBottom:8}},React.createElement("div",{className:"brandbar",style:{marginBottom:0}},React.createElement("div",{className:"logo",style:{width:28,height:28,fontSize:13,borderRadius:7}},"F"),React.createElement("h1",{style:{fontSize:15}},"FunConnect"))),React.createElement("nav",{style:{flex:1,display:"flex",flexDirection:"column",padding:"8px 10px"}},[{key:"connect",label:"Connect"},{key:"devices",label:"Devices"},{key:"deploy",label:"Deploy"}].map(f=>{if(f.admin&&!e)return null;let w=n===f.key;return React.createElement("button",{key:f.key,onClick:()=>s(f.key),style:{display:"flex",alignItems:"center",gap:8,width:"100%",padding:"9px 12px",marginBottom:2,border:0,borderRadius:8,background:w?"var(--brand)":"transparent",color:w?"#04121a":"var(--ink)",cursor:"pointer",fontSize:13.5,fontWeight:w?700:500,textAlign:"left",transition:"background .12s ease, color .12s ease"},onMouseEnter:k=>{w||(k.currentTarget.style.background="var(--panel-2)")},onMouseLeave:k=>{w||(k.currentTarget.style.background="transparent")}},f.label,f.admin&&React.createElement("span",{style:{fontSize:10,opacity:.5,marginLeft:"auto"}},"admin"))})),React.createElement("div",{style:{padding:"8px 16px",borderTop:"1px solid var(--line)"}},React.createElement("div",{style:{fontSize:12,color:"var(--muted)",marginBottom:8}},e?.username||"admin"),React.createElement("button",{className:"btn ghost sm",onClick:a,style:{width:"100%"}},"Log out"))),React.createElement("div",{style:{flex:1,padding:20,overflow:"auto"}},n==="connect"&&React.createElement(at,{onDeviceReady:(f,w)=>{o(f),c(w),s("devices")}}),n==="devices"&&React.createElement(React.Fragment,null,React.createElement("div",{style:{background:"#ff0",color:"#000",padding:"4px 8px",font:"bold 12px monospace",marginBottom:8}},"\\u26A0\\uFE0F AdminShell\\u2192AdminDevices deviceType=",i||"null"),React.createElement(st,{token:t,onLogout:a,deviceType:i})),n==="deploy"&&React.createElement(ot,{deviceId:l,setDeviceId:c,toast:m,onDone:()=>s("devices")}),b&&React.createElement("div",{className:"toast"},b)))}function st({token:e,onLogout:t,deviceType:a="cyberpi"}){let[n,s]=u(null),[i,o]=u(null),[l,r]=u(null),b=W(null);B(()=>{b.current=l},[l]),B(()=>{let m=!0,_=async()=>{try{let f=await Oe(e);if(!m)return;if(s(f),o(null),!b.current){let w=Ne(f),k=w.find(x=>x.online)?.target;if(!k)for(let x of w.slice(0,6))try{let R=await ae(x.target);if(m&&R&&R.online){k=x.target;break}}catch{}m&&r(k||w[0]?.target||null)}}catch(f){if(!m)return;if(f.status===401){t();return}o("Couldn\'t load devices \\u2014 the admin endpoint may not be deployed yet."),s([])}};_();let D=setInterval(_,15e3);return()=>{m=!1,clearInterval(D)}},[e,t]);let v=n?Ne(n):null,p=l&&v?v.find(m=>m.target===l):null,c=p?.deviceType||a;return React.createElement("div",{className:"admin-grid"},React.createElement("div",{style:{background:"#ff0",color:"#000",padding:"4px 8px",font:"bold 12px monospace",marginBottom:8,gridColumn:"1/-1"}},"\\u26A0\\uFE0F AdminDevices sel=",l||"null"," selType=",c||"null"," deviceTypeProp=",a||"null"," selGroupType=",p?.deviceType||"null"),React.createElement("div",{className:"card"},React.createElement("div",{className:"between",style:{marginBottom:12}},React.createElement("h3",{style:{margin:0}},"Devices"),v&&React.createElement("span",{className:"muted",style:{fontSize:12}},v.length," device",v.length===1?"":"s")),!n&&!i&&React.createElement("p",{className:"muted"},React.createElement("span",{className:"spinner"})," Loading\\u2026"),i&&React.createElement("p",{className:"err",style:{fontSize:13}},i),v&&v.length===0&&!i&&React.createElement("p",{className:"muted"},"No devices in your tenant yet."),v&&v.map(m=>React.createElement("button",{key:m.base,className:"alert-row "+(l===m.target?"sel":""),onClick:()=>r(m.target),style:{marginBottom:6}},React.createElement("span",{className:"ar-dot",style:{background:m.online?"var(--brand)":"var(--muted)"}}),React.createElement("span",{className:"ar-cls",style:{textTransform:"none"}},m.base),React.createElement("span",{className:"ar-meta"},m.telem.toLocaleString()," pkts"),React.createElement("span",{className:"ar-time"},m.online?"online":`${m.count} id${m.count===1?"":"s"}`)))),React.createElement("div",null,l?React.createElement(Pe,{deviceId:l,setDeviceId:r,follow:!1,showDeviceControls:!1,deviceType:c}):React.createElement("div",{className:"card"},React.createElement("p",{className:"muted",style:{margin:0}},"Select a device to view live telemetry."))))}function ot({deviceId:e,setDeviceId:t,toast:a,onDone:n}){let[s,i]=u("detect"),[o,l]=u(null),[r,b]=u(!1);return B(()=>{be().then(b)},[]),s==="deploy"&&o?React.createElement(Ae,{deviceType:"cyberpi",program:o,deviceId:e,setDeviceId:t,agent:r,onLive:n,onCancel:()=>i("catalog"),toast:a}):React.createElement(React.Fragment,null,React.createElement(De,{current:s}),s==="detect"&&React.createElement(qe,{agent:r,onStart:()=>i("catalog"),onViewDashboard:n}),s==="catalog"&&React.createElement(_e,{selected:o,onSelect:l,onDeploy:()=>o&&i("deploy"),onSkip:n}),s==="catalog"&&React.createElement("div",{style:{marginTop:16}},React.createElement("button",{className:"btn ghost sm",onClick:()=>i("detect")},"\\u2190 Back")))}function Ce(){let e="";try{e=(location.hash||"").replace(/^#\\/?/,"").toLowerCase()}catch{}return e.startsWith("catalog")||e.startsWith("deploy")?"catalog":e.startsWith("dashboard")?"dashboard":e.startsWith("login")?"login":"root"}function it(){let[e,t]=u(Ce),[a,n]=u(()=>pe()),[s,i]=u(()=>pe()?"checking":"anon"),[o,l]=u(null);B(()=>{let v=()=>t(Ce());return window.addEventListener("hashchange",v),()=>window.removeEventListener("hashchange",v)},[]),B(()=>{let v=!0;if(!a){i("anon"),l(null);return}i("checking");let p=new Promise((c,m)=>setTimeout(()=>m(new Error("timeout")),5e3));return Promise.race([Fe(a),p]).then(c=>{if(v)if(c)l(c),i("authed");else{l(null),i("anon");try{localStorage.removeItem(oe)}catch{}}}).catch(()=>{if(v){l(null),i("anon");try{localStorage.removeItem(oe)}catch{}}}),()=>{v=!1}},[a]),B(()=>{e==="catalog"||s==="checking"||(e==="root"?location.hash=s==="authed"?"#dashboard":"#login":e==="login"&&s==="authed"?location.hash="#dashboard":e==="dashboard"&&s==="anon"&&(location.hash="#login"))},[e,s]);let r=te(v=>{n(v),location.hash="#dashboard"},[]),b=te(()=>{try{localStorage.removeItem(oe)}catch{}n(null),l(null),i("anon"),location.hash="#login"},[]);return e==="catalog"?React.createElement(et,null):s==="checking"?React.createElement(le,null):e==="login"?s==="authed"?React.createElement(le,null):React.createElement(tt,{onSuccess:r}):e==="dashboard"&&s==="authed"?React.createElement(nt,{me:o,token:a,onLogout:b}):React.createElement(le,null)}ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(it,null));})();\n\r\n</script>\r\n<script>\r\ntry {\r\n  document.getElementById(\'fc-diag\').textContent = \'JS RUNNING\';\r\n  if (typeof React === \'undefined\') document.getElementById(\'fc-diag\').textContent = \'ERROR: React not loaded\';\r\n  else if (typeof ReactDOM === \'undefined\') document.getElementById(\'fc-diag\').textContent = \'ERROR: ReactDOM not loaded\';\r\n  else document.getElementById(\'fc-diag\').textContent = \'OK: React \' + React.version;\r\n} catch(e) {\r\n  document.getElementById(\'fc-diag\').textContent = \'ERROR: \' + e.message;\r\n}\r\nwindow.addEventListener(\'error\', function(e) {\r\n  document.getElementById(\'fc-diag\').textContent = \'CRASH: \' + e.message;\r\n});\r\n</script>\r\n</body>\r\n</html>\r\n';
+
+// ../../Projects/FunConnect/Edge/src/auth.ts
+var DEV_SECRET = "funconnect-dev-secret-change-in-production";
+function base64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function utf8Encode(s) {
+  return new TextEncoder().encode(s);
+}
+async function importKey(secret) {
+  return crypto.subtle.importKey(
+    "raw",
+    utf8Encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+}
+async function signToken(payload, secret = DEV_SECRET) {
+  const header = { alg: "HS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1e3);
+  const claims = { ...payload, iat: now, exp: now + 86400 };
+  const headerB64 = base64url(utf8Encode(JSON.stringify(header)));
+  const payloadB64 = base64url(utf8Encode(JSON.stringify(claims)));
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const key = await importKey(secret);
+  const sig = await crypto.subtle.sign("HMAC", key, utf8Encode(signingInput));
+  const sigB64 = base64url(sig);
+  return `${signingInput}.${sigB64}`;
+}
+async function verifyToken(token, secret = DEV_SECRET) {
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("invalid token format");
+  const [headerB64, payloadB64, sigB64] = parts;
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const key = await importKey(secret);
+  const sig = Uint8Array.from(atob(sigB64.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+  const valid = await crypto.subtle.verify("HMAC", key, sig, utf8Encode(signingInput));
+  if (!valid) throw new Error("invalid signature");
+  const payload = JSON.parse(atob(payloadB64.replace(/-/g, "+").replace(/_/g, "/")));
+  if (payload.exp && payload.exp < Math.floor(Date.now() / 1e3)) {
+    throw new Error("token expired");
+  }
+  return payload;
+}
+async function requireAuth(request, secret = DEV_SECRET) {
+  const auth = request.headers.get("Authorization");
+  if (!auth || !auth.startsWith("Bearer ")) {
+    throw new Error("missing token");
+  }
+  const token = auth.slice(7);
+  const claims = await verifyToken(token, secret);
+  return claims;
+}
+
+// ../../Projects/FunConnect/AI/chat.ts
+var DEFAULT_MODEL = "@cf/meta/llama-3.2-3b-instruct";
+var DEFAULT_FETCH_LIMIT = 25;
+var DEFAULT_CONTEXT_LIMIT = 5;
+var DEFAULT_MAX_TOKENS = 300;
+var SIGNATURE_MAP = {
+  0: { name: "Silent trigger", family: "noise" },
+  1: { name: "Desk spin", family: "spin" },
+  2: { name: "Forward nod", family: "spin" },
+  3: { name: "Diagonal wobble", family: "spin" },
+  4: { name: "Side rock", family: "spin" },
+  5: { name: "Coin wobble", family: "spin" },
+  6: { name: "Table jiggle", family: "spin" },
+  7: { name: "Brief jolt", family: "spin" },
+  8: { name: "Clean drop", family: "drop" },
+  9: { name: "Drop with spin", family: "drop" },
+  10: { name: "Edge drop", family: "drop" },
+  11: { name: "Corner drop", family: "drop" },
+  12: { name: "Side-edge drop", family: "drop" },
+  13: { name: "Corner drop with roll", family: "drop" },
+  14: { name: "Flat-edge drop", family: "drop" },
+  15: { name: "Hard drop", family: "drop" },
+  16: { name: "Short-side tap", family: "bump" },
+  17: { name: "Short-side clip", family: "bump" },
+  18: { name: "High side-nudge", family: "bump" },
+  19: { name: "Short-side slam", family: "bump" },
+  20: { name: "Side rock", family: "bump" },
+  21: { name: "Rolling side-hit", family: "bump" },
+  22: { name: "Tumbling side-hit", family: "bump" },
+  23: { name: "Violent side-hit", family: "bump" },
+  24: { name: "Diagonal tap", family: "corner" },
+  25: { name: "Diagonal corner clip", family: "corner" },
+  26: { name: "Diagonal nose-hit", family: "corner" },
+  27: { name: "Diagonal corner slam", family: "corner" },
+  28: { name: "Diagonal roll-hit", family: "corner" },
+  29: { name: "Diagonal roll-spin", family: "corner" },
+  30: { name: "Diagonal tumble", family: "corner" },
+  31: { name: "Diagonal crash", family: "corner" },
+  32: { name: "Long-side tap", family: "bump" },
+  33: { name: "Side-swipe", family: "bump" },
+  34: { name: "High push", family: "bump" },
+  35: { name: "Pitching side-hit", family: "bump" },
+  36: { name: "Rolling push", family: "bump" },
+  37: { name: "Rolling side-swipe", family: "bump" },
+  38: { name: "Tumbling push", family: "bump" },
+  39: { name: "Violent side-swipe", family: "bump" },
+  40: { name: "Diagonal tap", family: "corner" },
+  41: { name: "Diagonal clip", family: "corner" },
+  42: { name: "Nose-down hit", family: "corner" },
+  43: { name: "Nose-down slam", family: "corner" },
+  44: { name: "Side-angle hit", family: "corner" },
+  45: { name: "Side-angle spin", family: "corner" },
+  46: { name: "Side-angle tumble", family: "corner" },
+  47: { name: "Diagonal crash", family: "corner" },
+  48: { name: "Flat corner tap", family: "corner" },
+  49: { name: "Flat corner clip", family: "corner" },
+  50: { name: "Corner pitch-hit", family: "corner" },
+  51: { name: "Corner pitch-spin", family: "corner" },
+  52: { name: "Corner roll-hit", family: "corner" },
+  53: { name: "Corner roll-spin", family: "corner" },
+  54: { name: "Corner tumble", family: "corner" },
+  55: { name: "Flat crash", family: "corner" },
+  56: { name: "Ghost crash", family: "ghost" },
+  57: { name: "Triaxial yaw-crash", family: "crash" },
+  58: { name: "Triaxial pitch-crash", family: "crash" },
+  59: { name: "Triaxial pitch-spin crash", family: "crash" },
+  60: { name: "Triaxial roll-crash", family: "crash" },
+  61: { name: "Triaxial roll-spin crash", family: "crash" },
+  62: { name: "Cartwheel crash", family: "crash" },
+  63: { name: "Full crash", family: "crash" }
+};
+var BASELINE_TABLE = [
+  {
+    maxG: 0.2,
+    human: "below the sensor noise floor \u2014 probably benign",
+    robot: "Probably benign"
+  },
+  {
+    maxG: 0.5,
+    human: "a gentle tap with a fingertip",
+    robot: "Desk bump, cable snag"
+  },
+  {
+    maxG: 1,
+    human: "a firm poke",
+    robot: "Dropped from 2\u20135 cm"
+  },
+  {
+    maxG: 2,
+    human: "a solid shove, like a book falling flat",
+    robot: "Dropped from 10\u201320 cm, wall bump at low speed"
+  },
+  {
+    maxG: 3,
+    human: "like a book falling flat",
+    robot: "Dropped from 30\u201350 cm, moderate-speed collision"
+  },
+  {
+    maxG: 5,
+    human: "a hard fall from desk height",
+    robot: "Dropped from 1m+, high-speed wall hit"
+  },
+  {
+    maxG: Infinity,
+    human: "a violent impact",
+    robot: "Thrown, kicked, or fell from >2m"
+  }
+];
+function isCuriosityQuestion(message, intent) {
+  if (intent.classes.size > 0) return false;
+  if (/^(hi|hello|hey|good\s(morning|afternoon|evening)|sup|yo|howdy|greetings)[!.\s]*$/i.test(message.trim())) return false;
+  if (/\bwhat\s+happened|what\s+did\s+it\s+(feel|do)|is\s+(it|my\s+robot|the\s+robot)\s+ok|what\s+just\s+happened|anything\s+new|any\s+(updates|news|bumps)|tell\s+me\s+what|how\s+is\s+(it|my\s+robot|the\s+robot)\b/i.test(message)) return false;
+  const words = message.trim().split(/\s+/);
+  if (words.length >= 5) return true;
+  return /\b(madgwick|quaternion|filter|fusion|gimbal|sensor|imu|accelerometer|gyroscope|algorithm|math|physics|matrix|vector|beta|adaptive|ahrs|orientation|euler|rotation|freefall|explain|how\s+does|what\s+is|what\s+are|definition|meaning)\b/i.test(message);
+}
+function isTechnicalQuery(message) {
+  return /\b(madgwick|quaternion|filter|fusion|gimbal|matrix|vector|beta|adaptive|ahrs|gradient|jacobian|derivative|integral|algorithm|sensor\s*fusion|rotation\s*matrix|euler\s*angle)\b/i.test(message);
+}
+async function searchCorpus(db, query, limit = 3) {
+  const safe = query.replace(/[^\w\s-]/g, " ").replace(/\s+/g, " ").trim();
+  if (!safe || safe.length < 2) return [];
+  const ftsQuery = buildFtsQuery(safe);
+  try {
+    const stmt = db.prepare(
+      `SELECT title, content, tier, family, signature, rank
+       FROM corpus_fts
+       WHERE corpus_fts MATCH ?1
+       ORDER BY rank
+       LIMIT ?2`
+    ).bind(ftsQuery, limit);
+    const res = await stmt.all();
+    return (res.results ?? []).map((r) => ({
+      title: r.title,
+      content: r.content,
+      tier: r.tier,
+      family: r.family ?? null,
+      signature: r.signature ?? null
+    }));
+  } catch {
+    return [];
+  }
+}
+var STOP_WORDS = /* @__PURE__ */ new Set([
+  "what",
+  "is",
+  "a",
+  "an",
+  "the",
+  "how",
+  "does",
+  "do",
+  "did",
+  "why",
+  "explain",
+  "tell",
+  "me",
+  "about",
+  "can",
+  "you",
+  "i",
+  "we",
+  "it",
+  "in",
+  "on",
+  "of",
+  "to",
+  "for",
+  "and",
+  "or",
+  "that",
+  "this",
+  "are",
+  "was",
+  "were",
+  "be",
+  "been",
+  "have",
+  "has",
+  "had",
+  "will",
+  "would",
+  "shall",
+  "should",
+  "may",
+  "might",
+  "must",
+  "could",
+  "not",
+  "no",
+  "so",
+  "if",
+  "then",
+  "else",
+  "when",
+  "where",
+  "who",
+  "which",
+  "there",
+  "here",
+  "just",
+  "very",
+  "really",
+  "actually",
+  "please"
+]);
+function buildFtsQuery(sanitized) {
+  const words = sanitized.split(/\s+/).filter((w) => w.length > 1);
+  const content = words.filter((w) => !STOP_WORDS.has(w.toLowerCase()));
+  const terms = content.length > 0 ? content : words;
+  return terms.join(" OR ");
+}
+function buildCorpusPrompt(message, blocks, technical) {
+  const lines = [];
+  lines.push(
+    "You are FunConnect's friendly robot tutor, talking to a curious student.",
+    "",
+    `The student asked: "${message}"`,
+    "",
+    "Below are relevant passages from the robot's physics reference. Use them to answer the question accurately."
+  );
+  if (technical) {
+    lines.push(
+      "",
+      "TONE (technical \u2014 the student is ready for real concepts):",
+      "- Explain in detail. Use the physics terms from the passages and explain what they mean.",
+      "- Light math is OK when it helps understanding (simple equations, comparisons).",
+      "- Still be friendly \u2014 you're a tutor, not a textbook. 3-5 substantive sentences.",
+      "- End by asking if they want to go deeper on any part."
+    );
+  } else {
+    lines.push(
+      "",
+      "TONE (curious kid \u2014 keep it simple and fun):",
+      "- Use everyday analogies the student already knows (bikes, balls, swings, phones).",
+      "- No jargon unless you immediately explain it in plain words.",
+      "- Connect the physics to something they can picture or feel.",
+      "- 2-4 friendly sentences. Leave them curious to ask more."
+    );
+  }
+  lines.push(
+    "",
+    "RULES:",
+    "- Only use information from the passages below. Never invent physics.",
+    "- If the passages don't fully answer the question, say so honestly and suggest what they could ask instead.",
+    '- Never mention "the passages" or "the reference" \u2014 just answer naturally.',
+    "- You never run commands or make decisions. You only explain.",
+    "",
+    "PASSAGES:"
+  );
+  blocks.forEach((b, i) => {
+    lines.push(`[${i + 1}] ${b.title}: ${b.content}`);
+  });
+  return lines.join("\n");
+}
+async function chat(message, db, ai, opts = {}) {
+  const intent = detectIntent(message);
+  if (isCuriosityQuestion(message, intent)) {
+    const blocks = await searchCorpus(db, message, 3);
+    if (blocks.length > 0) {
+      const technical = isTechnicalQuery(message);
+      const system2 = buildCorpusPrompt(message, blocks, technical);
+      const user2 = message.trim();
+      const provider2 = opts.provider ?? workersAI(ai, opts.model, opts.maxTokens);
+      const think2 = (opts.autoThink ?? false) && shouldThink(intent);
+      let reply2;
+      try {
+        reply2 = (await provider2.generate(system2, user2, { think: think2 })).trim();
+      } catch {
+        reply2 = "I'd love to explain, but I'm having trouble looking up the answer right now. Try again in a moment!";
+      }
+      if (!reply2) reply2 = "That's a fascinating question! Let me think... Actually, I don't have enough information to answer that properly. Try asking me what the robot felt instead!";
+      return { reply: reply2, context: [] };
+    }
+  }
+  const buffer = opts.conversationBuffer ?? opts.history ?? [];
+  const contextualized = contextualizeQuery(message, buffer);
+  const d1Rows = await fetchAlerts(db, opts.deviceId, opts.fetchLimit ?? DEFAULT_FETCH_LIMIT);
+  const liveRows = (opts.liveAlerts ?? []).map((a) => ({
+    id: -1,
+    device_id: a.device_id,
+    event: a.event ?? null,
+    signature: a.signature ?? null,
+    created_at: a.do_ms ? Math.floor(a.do_ms / 1e3) : null,
+    do_ms: a.do_ms ?? null,
+    madgwick_json: a.madgwick_json ?? null
+  }));
+  const liveKeys = new Set(liveRows.map((r) => r.do_ms).filter((v) => v != null));
+  const rows = [...liveRows, ...d1Rows.filter((r) => !liveKeys.has(r.do_ms))];
+  const now = NOW();
+  const enriched = rows.map((r) => enrichAlert(r, now)).filter((a) => a !== null);
+  const selected = selectContext(enriched, intent, opts.contextLimit ?? DEFAULT_CONTEXT_LIMIT);
+  const system = buildSystemPrompt(enriched, selected, intent, opts.focus);
+  const user = contextualized.trim() || "What happened to my robot?";
+  const provider = opts.provider ?? workersAI(ai, opts.model, opts.maxTokens);
+  const think = (opts.autoThink ?? false) && shouldThink(intent);
+  let reply;
+  try {
+    reply = (await provider.generate(system, user, { think })).trim();
+  } catch {
+    reply = fallbackReply(selected);
+  }
+  if (!reply) reply = fallbackReply(selected);
+  return { reply, context: selected };
+}
+async function fetchAlerts(db, deviceId, limit) {
+  const sql = `SELECT id, device_id, event, signature, created_at, do_ms, madgwick_json
+       FROM alerts
+      WHERE madgwick_json IS NOT NULL` + (deviceId ? ` AND device_id = ?1 ORDER BY COALESCE(do_ms, created_at*1000) DESC LIMIT ?2` : ` ORDER BY COALESCE(do_ms, created_at*1000) DESC LIMIT ?1`);
+  const stmt = deviceId ? db.prepare(sql).bind(deviceId, limit) : db.prepare(sql).bind(limit);
+  const res = await stmt.all();
+  return res.results ?? [];
+}
+function signatureInfo(sig) {
+  if (sig == null || sig < 0 || sig > 63) return null;
+  return SIGNATURE_MAP[sig] ?? null;
+}
+function baselineFor(g) {
+  for (const b of BASELINE_TABLE) {
+    if (g < b.maxG) return b.human;
+  }
+  return BASELINE_TABLE[BASELINE_TABLE.length - 1].human;
+}
+function impactDirection(ax, ay, az) {
+  const abs = { x: Math.abs(ax), y: Math.abs(ay), z: Math.abs(az) };
+  const max = Math.max(abs.x, abs.y, abs.z);
+  if (max < 0.05) return "no clear direction \u2014 the hit was too gentle to tell";
+  const sorted = ["x", "y", "z"].sort((a, b) => abs[b] - abs[a]);
+  const dom = sorted[0], sub = sorted[1];
+  const label = {
+    x: ax > 0 ? "from the right side" : "from the left side",
+    y: ay > 0 ? "from the front" : "from behind",
+    z: az > 0 ? "from below (upward hit)" : "straight down"
+  };
+  const min = Math.min(abs.x, abs.y, abs.z);
+  if (min > max * 0.7) return "multi-directional impact";
+  let out = label[dom];
+  if (abs[sub] > max * 0.5) {
+    const subLabel = label[sub].replace(/^from /, "");
+    out += `, slightly ${subLabel}`;
+  }
+  return out;
+}
+function enrichAlert(row, nowMs = NOW()) {
+  let m;
+  try {
+    m = JSON.parse(row.madgwick_json ?? "");
+  } catch {
+    return null;
+  }
+  if (!m || typeof m !== "object") return null;
+  const ax = num(m.a_trans?.x), ay = num(m.a_trans?.y), az = num(m.a_trans?.z);
+  const impact_g = round22(Math.sqrt(ax * ax + ay * ay + az * az));
+  const roll = round1(num(m.roll));
+  const pitch = round1(num(m.pitch));
+  const at_ms = row.do_ms ?? (row.created_at ? row.created_at * 1e3 : nowMs);
+  const sig = signatureInfo(row.signature);
+  const dir = impactDirection(ax, ay, az);
+  const baseline = baselineFor(impact_g);
+  return {
+    id: row.id,
+    device_id: row.device_id,
+    event: row.event,
+    classification: normalizeClass(m.classification),
+    impact_g,
+    roll,
+    pitch,
+    freefall: m.freefall === true,
+    orientation: describeOrientation(roll, pitch),
+    ago: humanAgo(nowMs - at_ms),
+    at_ms,
+    signature: row.signature ?? null,
+    signature_name: sig?.name ?? null,
+    signature_family: sig?.family ?? null,
+    baseline_comparison: baseline,
+    impact_direction: dir
+  };
+}
+function describeOrientation(roll, pitch) {
+  const tilt = Math.max(Math.abs(roll), Math.abs(pitch));
+  if (tilt >= 150) return "flipped nearly upside down";
+  if (tilt >= 100) return "rolled right over onto its side";
+  if (tilt >= 55) return "tipped onto its side";
+  if (tilt >= 25) return "leaned over quite a bit";
+  if (tilt >= 10) return "tilted a little";
+  return "stayed the right way up";
+}
+var KEYWORDS = [
+  { re: /\b(fell|fall|falling|drop|dropped|freefall|free[- ]?fall|air|airborne)\b/i, classes: ["freefall", "crash"] },
+  { re: /\b(crash|crashed|smash|smashed|bang|banged|collide|collision|slam)\b/i, classes: ["crash"] },
+  { re: /\b(bump|bumped|tap|tapped|knock|knocked|push|pushed|nudge|hit)\b/i, classes: ["bump", "crash"] },
+  { re: /\b(shake|shaking|shook|vibrat\w*|wobble|wobbling|buzz|rattle)\b/i, classes: ["vibration"] },
+  { re: /\b(tilt|tilted|lean|leaned|tip|tipped|slant)\b/i, classes: ["tilt"] },
+  { re: /\b(flip|flipped|upside|over|rolled|topple|toppled)\b/i, flag: "orientationFocus" },
+  { re: /\b(how many|how often|count|number of|times|total)\b/i, flag: "wantsCount" },
+  { re: /\b(number|numbers|g[- ]?force|how many g|degrees|exact|data|value)\b/i, flag: "wantsNumbers" },
+  { re: /\bwhy\b/i, flag: "wantsWhy" },
+  { re: /\b(analy\w*|pattern|trend|repeat\w*|mishandl\w*|compare|overall|summar\w*|over time|history|each time|keep(s)? happening)\b/i, flag: "wantsAnalysis" }
+];
+function contextualizeQuery(message, buffer) {
+  const words = message.trim().split(/\s+/);
+  if (words.length > 5) return message;
+  if (/\b(crash|bump|tilt|fall|shake|event|alert|signature)\b/i.test(message)) return message;
+  const recent = buffer.slice(-3);
+  if (recent.length === 0) return message;
+  const lastAssistant = recent.filter((t) => t.role === "assistant").pop();
+  const lastUser = recent.filter((t) => t.role === "user").pop();
+  let prefix = "Previous conversation:\n";
+  if (lastUser) prefix += `User asked: "${lastUser.content}"
+`;
+  if (lastAssistant) prefix += `You answered: "${lastAssistant.content}"
+`;
+  prefix += `
+Now the user is asking: "${message}"`;
+  return prefix;
+}
+function detectIntent(message) {
+  const classes = /* @__PURE__ */ new Set();
+  const intent = {
+    classes,
+    wantsCount: false,
+    wantsNumbers: false,
+    wantsWhy: false,
+    orientationFocus: false,
+    wantsAnalysis: false
+  };
+  for (const k of KEYWORDS) {
+    if (!k.re.test(message)) continue;
+    k.classes?.forEach((c) => classes.add(c));
+    if (k.flag) intent[k.flag] = true;
+  }
+  return intent;
+}
+function shouldThink(intent) {
+  return intent.wantsAnalysis;
+}
+function selectContext(alerts, intent, limit) {
+  if (alerts.length === 0) return [];
+  const newest = alerts[0].at_ms;
+  const oldest = alerts[alerts.length - 1].at_ms;
+  const span = Math.max(1, newest - oldest);
+  const scored = alerts.map((a, i) => {
+    let score = (a.at_ms - oldest) / span - i * 1e-6;
+    if (intent.classes.has(a.classification)) score += 1.5;
+    if (intent.orientationFocus && Math.max(Math.abs(a.roll), Math.abs(a.pitch)) >= 55) score += 1;
+    if (intent.orientationFocus && a.freefall) score += 0.5;
+    if (intent.wantsWhy && (a.classification === "crash" || a.freefall)) score += 0.5;
+    return { a, score };
+  });
+  return scored.sort((p, q) => q.score - p.score).slice(0, limit).map((s) => s.a).sort((p, q) => q.at_ms - p.at_ms);
+}
+function buildSystemPrompt(all, selected, intent, focus) {
+  const lines = [];
+  lines.push(
+    "You are FunConnect's friendly robot helper, talking to primary-school children (about 10 years old) and their teachers.",
+    "A small classroom robot reports whenever it feels a movement. Your job is to explain what it felt in warm, simple words.",
+    "",
+    "RULES:",
+    "- Reply in 2-4 short sentences. Be kind, calm, and encouraging.",
+    '- Use everyday words a 10-year-old knows. No jargon, no code, no JSON, and never words like "a_trans", "quaternion", or "Madgwick".',
+    intent.wantsNumbers ? '- The child asked for figures, so you may include simple numbers (like "about 2 g" or "nearly upside down").' : "- Do NOT mention numbers, g-forces, or degrees unless the child explicitly asks. Describe things with feelings and comparisons instead.",
+    "- Only talk about the events listed below. Never invent an event. If the list is empty, reassure them the robot has been calm and hasn't felt any bumps.",
+    "- You never run commands or make decisions. You only explain, in friendly words, what already happened.",
+    "",
+    "WHAT THE ROBOT'S WORDS MEAN:",
+    "- crash: a hard bump or crash, like being knocked off a desk.",
+    "- bump: a gentle bump, tap, or push.",
+    "- tilt: it was slowly leaned or tilted, with no real knock.",
+    "- freefall: it was in the air for a moment \u2014 dropped or fell.",
+    "- vibration: it was shaking or wobbling.",
+    "- unknown: it felt something, but isn't sure what.",
+    "Roughly: a light tap is under 1 g; a firm bump (like catching a falling book) is about 1-2.5 g; a hard knock is 2.5-4 g; a big crash is more than 4 g."
+  );
+  if (intent.wantsCount) {
+    lines.push("", "TALLY (last " + all.length + " reports): " + tally(all));
+  }
+  if (focus && selected.length > 0) {
+    const focused = selected.find((a) => a.id === focus.alert_id) || selected[0];
+    lines.push(
+      "",
+      "FOCUSED EVENT (the user is asking about this specific event):",
+      `[1] ${contextLine(focused)}`,
+      "",
+      "Only talk about this event. Do not mention other events or the full timeline."
+    );
+  } else {
+    lines.push("", "ROBOT REPORTS (newest first):");
+    if (selected.length === 0) {
+      lines.push("(none \u2014 the robot has not reported any bumps recently.)");
+    } else {
+      selected.forEach((a, i) => lines.push(`[${i + 1}] ${contextLine(a)}`));
+    }
+  }
+  return lines.join("\n");
+}
+function contextLine(a) {
+  const parts = [
+    a.ago,
+    a.classification
+  ];
+  if (a.signature_name) {
+    parts.push(`${a.signature_name} (${a.signature_family})`);
+  }
+  parts.push(`felt like ${a.baseline_comparison} ${a.impact_direction}`);
+  parts.push(a.orientation + ` (roll ${a.roll}\xB0, pitch ${a.pitch}\xB0)`);
+  if (a.freefall) parts.push("was briefly in the air (freefall)");
+  else parts.push("no freefall");
+  parts.push(`(~${a.impact_g} g)`);
+  return parts.join(" \xB7 ");
+}
+function tally(alerts) {
+  const counts = /* @__PURE__ */ new Map();
+  for (const a of alerts) counts.set(a.classification, (counts.get(a.classification) ?? 0) + 1);
+  const order = ["crash", "bump", "tilt", "freefall", "vibration", "unknown"];
+  const parts = order.filter((c) => counts.get(c)).map((c) => `${counts.get(c)} ${c}${counts.get(c) > 1 ? c === "crash" ? "es" : "s" : ""}`);
+  return parts.length ? parts.join(", ") : "no events";
+}
+function fallbackReply(selected) {
+  if (selected.length === 0) {
+    return "Good news \u2014 your robot has been calm and hasn't felt any bumps lately. It's happily online and waiting for its next adventure!";
+  }
+  const a = selected[0];
+  const what = a.classification === "freefall" ? "took a little tumble through the air" : a.classification === "crash" ? "had a hard bump" : a.classification === "vibration" ? "did some shaking and wobbling" : a.classification === "tilt" ? "was tilted over gently" : "felt a small bump";
+  const kind = a.signature_name ? ` (a "${a.signature_name}" event)` : "";
+  const flip = a.orientation === "stayed the right way up" ? "" : ` It ${a.orientation}.`;
+  return `Your robot ${what}${kind} ${a.ago}.${flip} Don't worry \u2014 robots are tough, and it's still doing just fine.`;
+}
+function workersAI(ai, model = DEFAULT_MODEL, maxTokens = DEFAULT_MAX_TOKENS) {
+  return {
+    async generate(system, user) {
+      const out = await ai.run(model, {
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user }
+        ],
+        max_tokens: maxTokens,
+        temperature: 0.4
+      });
+      return out?.response ?? "";
+    }
+  };
+}
+function dashScope(apiKey, cfg = {}) {
+  const endpoint = cfg.endpoint ?? "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions";
+  const model = cfg.model ?? "qwen3.7-plus";
+  const maxTokens = cfg.maxTokens ?? DEFAULT_MAX_TOKENS;
+  const defaultThink = cfg.enableThinking ?? false;
+  const thinkingBudget = cfg.thinkingBudget;
+  return {
+    async generate(system, user, opts) {
+      const think = opts?.think ?? defaultThink;
+      const body = {
+        model,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user }
+        ],
+        max_tokens: maxTokens,
+        temperature: 0.4,
+        enable_thinking: think
+      };
+      if (think) body.thinking_budget = thinkingBudget;
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) throw new Error(`DashScope ${res.status}`);
+      const data = await res.json();
+      return cleanReply(data.choices?.[0]?.message?.content ?? "");
+    }
+  };
+}
+function NOW() {
+  return Date.now();
+}
+function num(v) {
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+function normalizeClass(c) {
+  const valid = ["crash", "bump", "tilt", "freefall", "vibration", "unknown"];
+  return valid.includes(c) ? c : "unknown";
+}
+function humanAgo(deltaMs) {
+  const s = Math.max(0, Math.round(deltaMs / 1e3));
+  if (s < 45) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} minute${m === 1 ? "" : "s"} ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} hour${h === 1 ? "" : "s"} ago`;
+  const d = Math.round(h / 24);
+  return `${d} day${d === 1 ? "" : "s"} ago`;
+}
+function round1(n) {
+  return Math.round(n * 10) / 10;
+}
+function round22(n) {
+  return Math.round(n * 100) / 100;
+}
+function cleanReply(s) {
+  const end = s.lastIndexOf("</think>");
+  const body = end >= 0 ? s.slice(end + "</think>".length) : s;
+  return body.replace(/<\/?think>/g, "").trim();
+}
+
+// ../../Projects/FunConnect/Edge/src/index.ts
+var CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Content-Type": "application/json"
+};
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: CORS });
+}
+function getTenantId(request) {
+  try {
+    const auth = request.headers.get("Authorization");
+    if (!auth?.startsWith("Bearer ")) return "admin";
+    const payload = auth.slice(7).split(".")[1];
+    const claims = JSON.parse(atob(payload));
+    return claims.tenant_id || "admin";
+  } catch {
+    return "admin";
+  }
+}
+async function sha256(input) {
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+var index_default = {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    if (path === "/api/devices" && request.method === "GET") {
+      try {
+        const tenantId = getTenantId(request);
+        const d1Result = await env.DB.prepare(
+          `SELECT device_id, MAX(created_at) as last_seen, COUNT(*) as total
+           FROM telemetry
+           WHERE created_at > ?1 AND tenant_id = ?2
+           GROUP BY device_id
+           ORDER BY last_seen DESC
+           LIMIT 20`
+        ).bind(Math.floor(Date.now() / 1e3) - 7200, tenantId).all();
+        const devices = [];
+        const seenIds = /* @__PURE__ */ new Set();
+        for (const row of d1Result.results) {
+          const deviceId = row.device_id;
+          seenIds.add(deviceId);
+          let online = false;
+          try {
+            const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${deviceId}`);
+            const stub = env.CYBERPI_HUB.get(doId);
+            const liveUrl = new URL(request.url);
+            liveUrl.pathname = "/api/live-status";
+            liveUrl.searchParams.set("device", deviceId);
+            liveUrl.searchParams.set("tenant", tenantId);
+            const liveRes = await stub.fetch(new Request(liveUrl.toString(), { method: "GET" }));
+            const liveData = await liveRes.json();
+            online = liveData.online || false;
+          } catch {
+          }
+          devices.push({
+            device_id: deviceId,
+            online,
+            last_seen: row.last_seen,
+            telemetry_count: row.total
+          });
+        }
+        try {
+          const rosterId = env.TENANT_ROSTER.idFromName(`${tenantId}/roster`);
+          const rosterStub = env.TENANT_ROSTER.get(rosterId);
+          const rosterUrl = new URL(request.url);
+          rosterUrl.pathname = "/list";
+          const rosterRes = await rosterStub.fetch(new Request(rosterUrl.toString()));
+          const rosterData = await rosterRes.json();
+          for (const d of rosterData.devices || []) {
+            if (seenIds.has(d.device_id)) continue;
+            let online = false;
+            try {
+              const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${d.device_id}`);
+              const stub = env.CYBERPI_HUB.get(doId);
+              const liveUrl = new URL(request.url);
+              liveUrl.pathname = "/api/live-status";
+              liveUrl.searchParams.set("device", d.device_id);
+              liveUrl.searchParams.set("tenant", tenantId);
+              const liveRes = await stub.fetch(new Request(liveUrl.toString(), { method: "GET" }));
+              const liveData = await liveRes.json();
+              online = liveData.online || false;
+            } catch {
+            }
+            if (online) {
+              devices.unshift({
+                device_id: d.device_id,
+                device_type: d.device_type,
+                online: true,
+                last_seen: 0,
+                telemetry_count: 0
+              });
+            }
+          }
+        } catch {
+        }
+        return json(devices);
+      } catch (err) {
+        return json({ error: "query failed", message: String(err) }, 500);
+      }
+    }
+    if (path === "/api/auth/login" && request.method === "POST") {
+      try {
+        const { username, password } = await request.json();
+        if (!username || !password) return json({ error: "username and password required" }, 400);
+        const pwHash = await sha256(password);
+        const user = await env.DB.prepare(
+          "SELECT id, tenant_id, role, name FROM users WHERE name = ?1 AND password_hash = ?2"
+        ).bind(username, pwHash).first();
+        if (!user) return json({ error: "invalid credentials" }, 401);
+        const token = await signToken({ sub: user.name, tenant_id: user.tenant_id, role: user.role });
+        return json({ token, user: { username: user.name, tenant_id: user.tenant_id, role: user.role } });
+      } catch {
+        return json({ error: "invalid json" }, 400);
+      }
+    }
+    if (path === "/api/me" && request.method === "GET") {
+      try {
+        const claims = await requireAuth(request);
+        const user = await env.DB.prepare(
+          "SELECT role FROM users WHERE name = ?1 AND tenant_id = ?2"
+        ).bind(claims.sub, claims.tenant_id).first();
+        return json({
+          username: claims.sub,
+          tenant_id: claims.tenant_id,
+          role: user?.role || "user"
+        });
+      } catch (err) {
+        return json({ error: err.message }, 401);
+      }
+    }
+    if (path === "/api/admin/devices" && request.method === "GET") {
+      try {
+        const claims = await requireAuth(request);
+        const tenantId = claims.tenant_id;
+        const d1Result = await env.DB.prepare(
+          `SELECT device_id, MAX(created_at) as last_seen, COUNT(*) as total
+           FROM telemetry WHERE created_at > ?1 AND tenant_id = ?2
+           GROUP BY device_id ORDER BY last_seen DESC LIMIT 50`
+        ).bind(Math.floor(Date.now() / 1e3) - 7200, tenantId).all();
+        const devices = [];
+        const seenIds = /* @__PURE__ */ new Set();
+        for (const row of d1Result.results) {
+          const deviceId = row.device_id;
+          seenIds.add(deviceId);
+          let online = false;
+          try {
+            const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${deviceId}`);
+            const stub = env.CYBERPI_HUB.get(doId);
+            const liveUrl = new URL(request.url);
+            liveUrl.pathname = "/api/live-status";
+            liveUrl.searchParams.set("device", deviceId);
+            liveUrl.searchParams.set("tenant", tenantId);
+            const liveRes = await stub.fetch(new Request(liveUrl.toString(), { method: "GET" }));
+            const liveData = await liveRes.json();
+            online = liveData.online || false;
+          } catch {
+          }
+          devices.push({
+            device_id: deviceId,
+            online,
+            last_seen: row.last_seen,
+            telemetry_count: row.total
+          });
+        }
+        try {
+          const rosterId = env.TENANT_ROSTER.idFromName(`${tenantId}/roster`);
+          const rosterStub = env.TENANT_ROSTER.get(rosterId);
+          const rosterUrl = new URL(request.url);
+          rosterUrl.pathname = "/list";
+          const rosterRes = await rosterStub.fetch(new Request(rosterUrl.toString()));
+          const rosterData = await rosterRes.json();
+          for (const d of rosterData.devices || []) {
+            if (seenIds.has(d.device_id)) continue;
+            let online = false;
+            try {
+              const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${d.device_id}`);
+              const stub = env.CYBERPI_HUB.get(doId);
+              const liveUrl = new URL(request.url);
+              liveUrl.pathname = "/api/live-status";
+              liveUrl.searchParams.set("device", d.device_id);
+              liveUrl.searchParams.set("tenant", tenantId);
+              const liveRes = await stub.fetch(new Request(liveUrl.toString(), { method: "GET" }));
+              const liveData = await liveRes.json();
+              online = liveData.online || false;
+            } catch {
+            }
+            if (online) {
+              devices.unshift({
+                device_id: d.device_id,
+                device_type: d.device_type,
+                online: true,
+                last_seen: 0,
+                telemetry_count: 0
+              });
+            }
+          }
+        } catch {
+        }
+        return json(devices);
+      } catch (err) {
+        const msg = err.message;
+        if (msg === "missing token" || msg.includes("invalid") || msg.includes("expired")) {
+          return json({ error: msg }, 401);
+        }
+        return json({ error: msg }, 500);
+      }
+    }
+    if (path === "/api/chat" && request.method === "POST") {
+      try {
+        const tenantId = getTenantId(request);
+        const body = await request.json();
+        const { message, device_id, history, focus } = body;
+        if (!message) return json({ error: "message required" }, 400);
+        let deviceId = device_id || null;
+        if (!deviceId) {
+          const recent = await env.DB.prepare(
+            "SELECT device_id FROM telemetry WHERE tenant_id = ?1 ORDER BY created_at DESC LIMIT 1"
+          ).bind(tenantId).first();
+          deviceId = recent?.device_id || null;
+        }
+        if (!deviceId) return json({ reply: "No devices found for this tenant. Connect a device first.", context: [] });
+        const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${deviceId}`);
+        const stub = env.CYBERPI_HUB.get(doId);
+        let conversationBuffer = [];
+        try {
+          const bufUrl = new URL(request.url);
+          bufUrl.pathname = "/do-conversation-buffer";
+          bufUrl.searchParams.set("device", deviceId);
+          bufUrl.searchParams.set("tenant", tenantId);
+          const bufRes = await stub.fetch(new Request(bufUrl.toString(), { method: "GET" }));
+          if (bufRes.ok) conversationBuffer = (await bufRes.json()).turns ?? [];
+        } catch {
+        }
+        let liveAlerts = [];
+        try {
+          const alertUrl = new URL(request.url);
+          alertUrl.pathname = "/do-recent-alerts";
+          alertUrl.searchParams.set("device", deviceId);
+          alertUrl.searchParams.set("tenant", tenantId);
+          const alertRes = await stub.fetch(new Request(alertUrl.toString(), { method: "GET" }));
+          if (alertRes.ok) liveAlerts = (await alertRes.json()).alerts ?? [];
+        } catch {
+        }
+        const provider = env.DASHSCOPE_KEY ? dashScope(env.DASHSCOPE_KEY, { model: "qwen3.7-plus" }) : void 0;
+        const result = await chat(message, env.DB, env.AI, {
+          provider,
+          autoThink: env.CHAT_THINKING === "on",
+          deviceId,
+          liveAlerts,
+          conversationBuffer,
+          history,
+          focus
+        });
+        const appendUrl = new URL(request.url);
+        appendUrl.pathname = "/do-conversation-append";
+        stub.fetch(new Request(appendUrl.toString(), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            device_id: deviceId,
+            tenant_id: tenantId,
+            turns: [
+              { role: "user", content: message },
+              { role: "assistant", content: result.reply }
+            ]
+          })
+        })).catch(() => {
+        });
+        return json(result);
+      } catch (err) {
+        return json({ error: "chat failed", message: String(err) }, 500);
+      }
+    }
+    if (path === "/api/catalog" && request.method === "GET") {
+      const list = CATALOG.map(({ content, ...entry }) => entry);
+      return json(list);
+    }
+    const metaMatch = path.match(/^\/api\/catalog\/(.+)\/meta$/);
+    if (metaMatch && request.method === "GET") {
+      const entry = CATALOG.find((e) => e.id === metaMatch[1]);
+      if (!entry) return json({ error: "not found" }, 404);
+      const { content, ...meta } = entry;
+      return json(meta);
+    }
+    const catalogMatch = path.match(/^\/api\/catalog\/(.+)$/);
+    if (catalogMatch && request.method === "GET") {
+      const entry = CATALOG.find((e) => e.id === catalogMatch[1]);
+      if (!entry) return json({ error: "not found" }, 404);
+      return new Response(entry.content, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/x-python; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${entry.id}.py"`,
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+    const statusMatch = path.match(/^\/api\/device\/(.+)\/status$/);
+    if (statusMatch && request.method === "GET") {
+      const deviceId = statusMatch[1];
+      const tenantId = getTenantId(request);
+      try {
+        const d1Result = await env.DB.prepare(
+          "SELECT MAX(created_at) as last_seen, COUNT(*) as total FROM telemetry WHERE device_id = ?1 AND tenant_id = ?2"
+        ).bind(deviceId, tenantId).first();
+        const lastSeen = d1Result?.last_seen || 0;
+        const total = d1Result?.total || 0;
+        let online = false;
+        let bufferTelemetry = 0;
+        let bufferAlerts = 0;
+        try {
+          const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${deviceId}`);
+          const stub = env.CYBERPI_HUB.get(doId);
+          const liveUrl = new URL(request.url);
+          liveUrl.pathname = "/api/live-status";
+          liveUrl.searchParams.set("device", deviceId);
+          liveUrl.searchParams.set("tenant", tenantId);
+          const liveRes = await stub.fetch(new Request(liveUrl.toString(), { method: "GET" }));
+          const liveData = await liveRes.json();
+          online = liveData.online || false;
+          bufferTelemetry = liveData.buffer_telemetry || 0;
+          bufferAlerts = liveData.buffer_alerts || 0;
+        } catch {
+        }
+        return json({
+          device_id: deviceId,
+          online,
+          last_seen_ms: lastSeen * 1e3,
+          telemetry_count: total + bufferTelemetry,
+          alert_count: bufferAlerts
+        });
+      } catch (err) {
+        return json({ error: "query failed", message: String(err) }, 500);
+      }
+    }
+    if (path === "/api/device-ids" && request.method === "GET") {
+      const deviceId = url.searchParams.get("device") || "1262112";
+      const tenantId = getTenantId(request);
+      const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${deviceId}`);
+      const stub = env.CYBERPI_HUB.get(doId);
+      const qUrl = new URL(request.url);
+      qUrl.pathname = "/api/device-ids";
+      qUrl.searchParams.set("tenant", tenantId);
+      return stub.fetch(new Request(qUrl.toString(), { method: "GET" }));
+    }
+    const debugMatch = path.match(/^\/api\/device\/(.+)\/debug$/);
+    if (debugMatch && request.method === "GET") {
+      const tenantId = getTenantId(request);
+      const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${debugMatch[1]}`);
+      const stub = env.CYBERPI_HUB.get(doId);
+      const debugUrl = new URL(request.url);
+      debugUrl.pathname = "/api/debug";
+      debugUrl.searchParams.set("tenant", tenantId);
+      return stub.fetch(new Request(debugUrl.toString(), { method: "GET" }));
+    }
+    const echoMatch = path.match(/^\/api\/device\/(.+)\/echo$/);
+    if (echoMatch && request.method === "POST") {
+      const tenantId = getTenantId(request);
+      const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${echoMatch[1]}`);
+      const stub = env.CYBERPI_HUB.get(doId);
+      const relayUrl = new URL(request.url);
+      relayUrl.pathname = "/api/echo";
+      relayUrl.searchParams.set("tenant", tenantId);
+      return stub.fetch(new Request(relayUrl.toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(await request.json())
+      }));
+    }
+    const execMatch = path.match(/^\/api\/device\/(.+)\/exec$/);
+    if (execMatch && request.method === "POST") {
+      const tenantId = getTenantId(request);
+      const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${execMatch[1]}`);
+      const stub = env.CYBERPI_HUB.get(doId);
+      const relayUrl = new URL(request.url);
+      relayUrl.pathname = "/api/exec";
+      relayUrl.searchParams.set("tenant", tenantId);
+      return stub.fetch(new Request(relayUrl.toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(await request.json())
+      }));
+    }
+    const fsTestMatch = path.match(/^\/api\/device\/(.+)\/fs-test$/);
+    if (fsTestMatch && request.method === "POST") {
+      const tenantId = getTenantId(request);
+      const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${fsTestMatch[1]}`);
+      const stub = env.CYBERPI_HUB.get(doId);
+      const relayUrl = new URL(request.url);
+      relayUrl.pathname = "/api/fs-test";
+      relayUrl.searchParams.set("tenant", tenantId);
+      return stub.fetch(new Request(relayUrl.toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      }));
+    }
+    const deviceMatch = path.match(/^\/device\/(.+)$/);
+    if (deviceMatch) {
+      const tenantId = getTenantId(request);
+      const deviceId = deviceMatch[1];
+      const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${deviceId}`);
+      const stub = env.CYBERPI_HUB.get(doId);
+      const wsUrl = new URL(request.url);
+      wsUrl.searchParams.set("tenant", tenantId);
+      return stub.fetch(new Request(wsUrl.toString(), request));
+    }
+    const dashboardMatch = path.match(/^\/dashboard\/(.+)$/);
+    if (dashboardMatch) {
+      const tenantId = getTenantId(request);
+      const deviceId = dashboardMatch[1];
+      const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${deviceId}`);
+      const stub = env.CYBERPI_HUB.get(doId);
+      const wsUrl = new URL(request.url);
+      wsUrl.searchParams.set("tenant", tenantId);
+      return stub.fetch(new Request(wsUrl.toString(), request));
+    }
+    if (path === "/do-hello-count" && request.method === "GET") {
+      const deviceId = url.searchParams.get("device") || "cyberpi";
+      const tenantId = url.searchParams.get("tenant") || getTenantId(request);
+      const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${deviceId}`);
+      const stub = env.CYBERPI_HUB.get(doId);
+      const fwd = new URL(url.toString());
+      fwd.searchParams.set("tenant", tenantId);
+      return stub.fetch(new Request(fwd.toString(), { method: "GET" }));
+    }
+    if (path === "/do-telemetry-sample" && request.method === "GET") {
+      const deviceId = url.searchParams.get("device") || "cyberpi";
+      const tenantId = url.searchParams.get("tenant") || getTenantId(request);
+      const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${deviceId}`);
+      const stub = env.CYBERPI_HUB.get(doId);
+      const fwd = new URL(url.toString());
+      fwd.searchParams.set("tenant", tenantId);
+      return stub.fetch(new Request(fwd.toString(), { method: "GET" }));
+    }
+    if (path === "/do-telemetry-count" && request.method === "GET") {
+      const deviceId = url.searchParams.get("device") || "cyberpi";
+      const tenantId = url.searchParams.get("tenant") || getTenantId(request);
+      const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${deviceId}`);
+      const stub = env.CYBERPI_HUB.get(doId);
+      const fwd = new URL(url.toString());
+      fwd.searchParams.set("tenant", tenantId);
+      return stub.fetch(new Request(fwd.toString(), { method: "GET" }));
+    }
+    if (path === "/do-alert-count" && request.method === "GET") {
+      const deviceId = url.searchParams.get("device") || "cyberpi";
+      const tenantId = url.searchParams.get("tenant") || getTenantId(request);
+      const doId = env.CYBERPI_HUB.idFromName(`${tenantId}/${deviceId}`);
+      const stub = env.CYBERPI_HUB.get(doId);
+      const fwd = new URL(url.toString());
+      fwd.searchParams.set("tenant", tenantId);
+      return stub.fetch(new Request(fwd.toString(), { method: "GET" }));
+    }
+    if (path === "/api/roster/list" && request.method === "GET") {
+      try {
+        const claims = await requireAuth(request);
+        const rosterId = env.TENANT_ROSTER.idFromName(`${claims.tenant_id}/roster`);
+        const stub = env.TENANT_ROSTER.get(rosterId);
+        const rosterUrl = new URL(request.url);
+        rosterUrl.pathname = "/list";
+        return stub.fetch(new Request(rosterUrl.toString()));
+      } catch (err) {
+        return json({ error: err.message }, 401);
+      }
+    }
+    const rosterDeviceMatch = path.match(/^\/api\/roster\/(.+)$/);
+    if (rosterDeviceMatch && request.method === "GET") {
+      try {
+        const claims = await requireAuth(request);
+        const rosterId = env.TENANT_ROSTER.idFromName(`${claims.tenant_id}/roster`);
+        const stub = env.TENANT_ROSTER.get(rosterId);
+        const rosterUrl = new URL(request.url);
+        rosterUrl.pathname = `/${rosterDeviceMatch[1]}`;
+        return stub.fetch(new Request(rosterUrl.toString()));
+      } catch (err) {
+        return json({ error: err.message }, 401);
+      }
+    }
+    if (path === "/api/tenant/config" && request.method === "GET") {
+      try {
+        const claims = await requireAuth(request);
+        const config = await env.DB.prepare(
+          "SELECT id, name, jurisdiction, billing_plan FROM tenants WHERE id = ?1"
+        ).bind(claims.tenant_id).first();
+        if (!config) return json({ error: "tenant not found" }, 404);
+        return json(config);
+      } catch (err) {
+        return json({ error: err.message }, 401);
+      }
+    }
+    if (path === "/api/health") {
+      return json({ status: "ok", service: "FunConnect v1", timestamp: Date.now() });
+    }
+    if (path === "/ws-test" && request.method === "GET") {
+      return new Response(`<!DOCTYPE html><html><body style="background:#0a0e14;color:#e8eef6;font:15px monospace;padding:20px">
+<h2>Serial Relay Diagnostic</h2>
+<button onclick="testWss()" style="padding:8px 16px;margin:4px">Test WSS Only</button>
+<button onclick="testSerial()" style="padding:8px 16px;margin:4px">Test Serial + WSS</button>
+<button onclick="testBareSerial()" style="padding:8px 16px;margin:4px">Test Serial Only</button>
+<div id="log" style="margin-top:16px;line-height:1.6"></div>
+<script>
+const L=msg=>{document.getElementById('log').innerHTML+='<div>'+msg+'</div>'};
+function testWss(){
+L('--- Testing WSS only ---');
+const ws=new WebSocket('wss://funconnect-v1.funconnect.workers.dev/device/cyberpi-relay');
+ws.onopen=()=>{L('\u2705 WSS OPEN');ws.send(JSON.stringify({type:'hello',device_id:'cyberpi-relay',device_type:'cyberpi',ts:Date.now()}));};
+ws.onmessage=e=>L('\u{1F4E9} '+e.data.substring(0,150));
+ws.onerror=()=>L('\u274C WSS ERROR');
+ws.onclose=e=>L('\u{1F534} WSS CLOSE '+e.code);
+}
+async function testSerial(){
+L('--- Testing Serial + WSS ---');
+try{
+L('Step 1: requestPort...');
+const port=await navigator.serial.requestPort();
+L('Step 2: port selected: '+port.getInfo().usbVendorId);
+L('Step 3: opening port at 115200...');
+await port.open({baudRate:115200});
+L('Step 4: port opened. Opening WSS...');
+const ws=new WebSocket('wss://funconnect-v1.funconnect.workers.dev/device/cyberpi-relay');
+ws.onopen=()=>{L('\u2705 WSS OPEN after serial');};
+ws.onerror=()=>L('\u274C WSS ERROR after serial');
+ws.onclose=e=>L('\u{1F534} WSS CLOSE '+e.code);
+await new Promise((resolve,reject)=>{ws.onopen=resolve;ws.onerror=()=>reject(new Error('WSS failed after serial'));});
+L('\u2705\u2705 BOTH CONNECTED!');
+}catch(e){L('\u274C FAILED: '+e.message+' | '+e.stack?.substring(0,200));}
+}
+async function testBareSerial(){
+L('--- Testing Serial only ---');
+try{L('requestPort...');
+const port=await navigator.serial.requestPort();
+L('port selected');
+await port.open({baudRate:115200});
+L('\u2705 Serial port opened at 115200');
+const reader=port.readable.getReader();
+const t=new TextDecoder();
+let buf='';
+for(let i=0;i<5;i++){
+const {value,done}=await reader.read();
+if(done)break;
+buf+=t.decode(value);
+const lines=buf.split('\\n');
+buf=lines.pop();
+if(lines.length)L('\u{1F4DF} '+lines[lines.length-1].substring(0,80));
+}
+reader.releaseLock();
+await port.close();
+L('\u2705 Serial test complete');
+}catch(e){L('\u274C Serial failed: '+e.message);}
+}
+</script></body></html>`, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+    if (path === "/" && request.method === "GET") {
+      return new Response(SPA_HTML, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          // SPA entry point changes on every deploy — never cache it, so
+          // clients always get the latest build without a hard refresh.
+          "Cache-Control": "no-store, must-revalidate"
+        }
+      });
+    }
+    return json({ error: "not found", path }, 404);
+  }
+};
+export {
+  CyberpiHub,
+  TenantRoster,
+  index_default as default
+};
+
+------FormBoundary368599022--

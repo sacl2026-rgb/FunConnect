@@ -1,0 +1,17 @@
+{
+  "name": "funconnect-v1-edge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.js",
+    "deploy": "node deploy.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  },
+  "dependencies": {
+    "durable-utils": "^0.3.5",
+    "ws": "^8.21.0"
+  }
+}

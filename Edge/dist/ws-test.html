@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<body>
+<h1>WSS Test</h1>
+<div id="log"></div>
+<script>
+const log = (msg) => { document.getElementById('log').innerHTML += msg + '<br>'; console.log(msg); };
+log('Opening WSS...');
+const ws = new WebSocket('wss://funconnect-v1.funconnect.workers.dev/device/cyberpi-relay');
+ws.onopen = () => { log('OPEN'); ws.send(JSON.stringify({type:'hello',device_id:'cyberpi-relay',device_type:'cyberpi',ts:Date.now()})); };
+ws.onmessage = (e) => log('MSG: ' + e.data.substring(0, 150));
+ws.onerror = () => log('ERROR');
+ws.onclose = (e) => log('CLOSE: ' + e.code);
+</script>
+</body>
+</html>

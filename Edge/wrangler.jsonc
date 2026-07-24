@@ -1,0 +1,36 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "funconnect-v1",
+  "main": "dist/worker.mjs",
+  "compatibility_date": "2026-07-09",
+  "workers_dev": true,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "funconnect-v1-db",
+      "database_id": "PLACEHOLDER"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CYBERPI_HUB",
+        "class_name": "CyberpiHub"
+      },
+      {
+        "name": "TENANT_ROSTER",
+        "class_name": "TenantRoster"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["CyberpiHub"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["TenantRoster"]
+    }
+  ]
+}

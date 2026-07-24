@@ -1,0 +1,2359 @@
+
+const { useState, useEffect, useRef, useCallback } = React;
+import { startRelay, disconnectRelay, getActiveRelay, sendToDevice } from "./relay.js";
+import { flashViaWebUSB } from "./webusb-flash.js";
+
+const API_BASE = "https://funconnect-v1.funconnect.workers.dev";
+const WS_BASE  = "wss://funconnect-v1.funconnect.workers.dev";
+const MBLOCK_IDE = "https://ide.mblock.cc/";
+const DEFAULT_DEVICE_ID = "cyberpi";
+const MLINK_DOWNLOAD = "https://mblock.makeblock.com/en-us/download/";
+
+// Device profiles — one entry per supported device. The detection screen reads
+// these to render cards; the dashboard, catalog, and deploy flow each use the
+// selected profile to decide what to show. Adding a device = adding one object.
+const DEVICE_PROFILES = {
+  cyberpi: {
+    id: "cyberpi",
+    name: "CyberPi",
+    description: "ESP32 microcontroller with IMU, LCD, and LED ring",
+    connection: { method: "USB", tool: "mBlock" },
+    defaultDeviceId: "cyberpi",
+    catalogTag: "cyberpi",
+    telemetry: { dashboardPanel: "imu" },
+    deploy: { transport: "popup", programFormat: ".py" },
+    transports: [
+      { id: "serial", label: "USB (WebSerial)", description: "Direct USB connection — no WiFi setup, no mBlock. Requires relay.py flashed to the board.", deviceId: "cyberpi" },
+      { id: "wifi", label: "WiFi (mBlock)", description: "Flash via mBlock — requires WiFi + mLink2. Works with any CyberPi program.", deviceId: "cyberpi" },
+    ],
+  },
+  microbit: {
+    id: "microbit",
+    name: "micro:bit",
+    description: "ARM Cortex-M0 with 5×5 LED matrix, accelerometer, and edge connector — works with all micro:bits",
+    connection: { method: "USB", tool: "Serial" },
+    defaultDeviceId: "microbit-01",
+    catalogTag: "microbit",
+    telemetry: { dashboardPanel: "microbit" },
+    deploy: { transport: "msd", programFormat: ".hex" },
+    transports: [
+      { id: "serial", label: "USB (WebSerial)", description: "Direct USB connection — plug in and connect. No WiFi setup.", deviceId: "microbit-01" },
+    ],
+  },
+};
+
+// 5×5 LED patterns for micro:bit dashboard preview — 25-element arrays,
+// row-major. 1 = lit (var(--brand)), 0 = off (var(--line)).
+const LED_PATTERNS = {
+  heart:  [0,1,0,1,0, 1,1,1,1,1, 1,1,1,1,1, 0,1,1,1,0, 0,0,1,0,0],
+  smile:  [0,0,0,0,0, 0,1,0,1,0, 0,0,0,0,0, 1,0,0,0,1, 0,1,1,1,0],
+  sad:    [0,0,0,0,0, 0,1,0,1,0, 0,0,0,0,0, 0,1,1,1,0, 1,0,0,0,1],
+  star:   [0,0,1,0,0, 0,0,1,0,0, 1,1,1,1,1, 0,0,1,0,0, 0,0,1,0,0],
+  clear:  [0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0],
+};
+
+// Path B (future): a local FunConnect agent bridges the Worker → mLink2, so the
+// popup disappears. It answers on a known local endpoint. Detection is
+// best-effort — on HTTPS the browser blocks localhost (Private Network Access),
+// so this resolves false and we use Path A (popup). Transport is a toggle, not
+// a rewrite: catalog + dashboard are identical, only upload differs.
+const AGENT_PING = "http://localhost:52384/funconnect/ping";
+async function detectAgent(timeoutMs = 1400) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(AGENT_PING, { signal: ctrl.signal, cache: "no-store" });
+    clearTimeout(t);
+    return r.ok;                 // agent present and CORS-enabled
+  } catch {
+    clearTimeout(t);
+    return false;                // absent, refused, or blocked by PNA
+  }
+}
+
+// ---- flow steps ---------------------------------------------------------
+const STEPS = [
+  { key: "detect",    label: "Connect Device" },
+  { key: "catalog",   label: "Choose Program" },
+  { key: "deploy",    label: "Deploy" },
+  { key: "dashboard", label: "Live" },
+];
+
+// ---- API helpers --------------------------------------------------------
+async function getCatalog() {
+  const r = await fetch(`${API_BASE}/api/catalog`, { cache: "no-store" });
+  if (!r.ok) throw new Error(`catalog HTTP ${r.status}`);
+  return r.json();
+}
+async function getProgramSource(id) {
+  const r = await fetch(`${API_BASE}/api/catalog/${encodeURIComponent(id)}`, { cache: "no-store" });
+  if (!r.ok) throw new Error(`download HTTP ${r.status}`);
+  return r.text();
+}
+async function getDeviceStatus(id) {
+  const r = await fetch(`${API_BASE}/api/device/${encodeURIComponent(id)}/status`, { cache: "no-store" });
+  if (!r.ok) throw new Error(`status HTTP ${r.status}`);
+  return r.json();
+}
+
+// Find the currently-live device. Edge's GET /api/devices lists recently-seen
+// ids, but its `online` flags lag the ~44-min rotation (often ALL false) and it
+// can omit the live base id after a cycle-back. So we don't trust the flags: we
+// gather candidates (listed ids + their base form + the current id) and confirm
+// liveness against each device's authoritative /status. Returns {device_id, device_type}
+// or null. device_type comes from the roster (device_type field) or falls back to
+// status response (device_type field), then to "cyberpi" as last resort.
+async function discoverLiveDevice(currentId) {
+  let list = [];
+  let typeMap = {};   // device_id → device_type from the roster
+  try {
+    const r = await fetch(`${API_BASE}/api/devices`, { cache: "no-store" });
+    if (r.ok) { const d = await r.json(); list = Array.isArray(d) ? d : (d && d.devices) || []; }
+  } catch {}
+  const norm = list
+    .map(x => (typeof x === "string" ? { device_id: x } : x))
+    .filter(x => x && x.device_id)
+    .sort((a, b) => (b.last_seen || b.last_seen_ms || 0) - (a.last_seen || a.last_seen_ms || 0));
+  norm.forEach(x => { if (x.device_type) typeMap[x.device_id] = x.device_type; });
+
+  // Trust an online flag if the endpoint ever sets one truthfully.
+  const flagged = norm.find(x => x.online);
+  if (flagged) return { device_id: flagged.device_id, device_type: flagged.device_type || typeMap[flagged.device_id] || "cyberpi" };
+
+  // Flags unreliable → verify a handful of best guesses ourselves.
+  const base = id => id.replace(/-r\d+$/, "");
+  const cands = [];
+  const push = id => { if (id && !cands.includes(id)) cands.push(id); };
+  norm.slice(0, 4).forEach(x => { push(x.device_id); push(base(x.device_id)); });
+  push(currentId); push(base(currentId));
+  for (const id of cands) {
+    try { const s = await getDeviceStatus(id); if (s && s.online) return { device_id: id, device_type: s.device_type || typeMap[id] || typeMap[base(id)] || "cyberpi" }; } catch {}
+  }
+  return null;
+}
+
+// ---- Auth (Edge builds login / JWT / admin; shapes below are best-effort) ----
+const JWT_KEY = "fc_jwt";
+function getJwt() { try { return localStorage.getItem(JWT_KEY); } catch { return null; } }
+
+// POST /api/auth/login → { token } (also accepts jwt / access_token). Throws with
+// .status on non-2xx so the form can distinguish 401 from other failures.
+async function apiLogin(username, password) {
+  const r = await fetch(`${API_BASE}/api/auth/login`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!r.ok) { const e = new Error("login failed"); e.status = r.status; throw e; }
+  const d = await r.json().catch(() => ({}));
+  return d.token || d.jwt || d.access_token || null;
+}
+
+// GET /api/me with the JWT → user object (200) or null (401/unreachable).
+async function apiMe(token) {
+  try {
+    const r = await fetch(`${API_BASE}/api/me`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+    return r.ok ? await r.json().catch(() => ({})) : null;
+  } catch { return null; }
+}
+
+// GET /api/admin/devices → tenant devices. Throws {status:401} on expired token.
+async function apiAdminDevices(token) {
+  const r = await fetch(`${API_BASE}/api/admin/devices`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+  if (r.status === 401) { const e = new Error("unauthorized"); e.status = 401; throw e; }
+  if (!r.ok) return [];
+  const d = await r.json().catch(() => []);
+  return Array.isArray(d) ? d : (d.devices || []);
+}
+
+// The firmware rotates device_id (mbot2-01-r1…r21 → mbot2-01), so the admin list
+// is flooded with one physical device's history. Collapse by base id → one row
+// per device. Each group tracks aggregate telemetry, latest activity, whether any
+// rotation is online, and a `target` id to actually connect to.
+const baseId = id => id.replace(/-r\d+$/, "");
+function groupDevices(list) {
+  const groups = new Map();
+  for (const d of list) {
+    const id = d.device_id || d.id;
+    if (!id) continue;
+    const b = baseId(id);
+    let g = groups.get(b);
+    if (!g) { g = { base: b, online: false, lastSeen: 0, telem: 0, count: 0, onlineId: null, reprId: id, reprLs: -1, deviceType: null }; groups.set(b, g); }
+    g.count++;
+    g.telem += d.telemetry_count || 0;
+    const ls = d.last_seen || d.last_seen_ms || 0;
+    if (ls > g.lastSeen) g.lastSeen = ls;
+    if (d.online) { g.online = true; g.onlineId = id; }
+    if (ls >= g.reprLs) { g.reprLs = ls; g.reprId = id; if (d.device_type) g.deviceType = d.device_type; }
+    if (!g.deviceType && d.device_type) g.deviceType = d.device_type;
+  }
+  const arr = [...groups.values()];
+  arr.forEach(g => { g.target = g.onlineId || g.base; });   // connect to the live rotation, else the base id
+  arr.sort((a, b) => (b.online ? 1 : 0) - (a.online ? 1 : 0) || b.lastSeen - a.lastSeen);
+  return arr;
+}
+
+// Download a catalog .hex file to disk (manual save via object URL).
+async function downloadHex(programId, programName) {
+  try {
+    const resp = await fetch(`${API_BASE}/api/catalog/${encodeURIComponent(programId)}`);
+    if (!resp.ok) throw new Error(`Catalog download failed (${resp.status})`);
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${programName || programId}.hex`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (e) {
+    console.error("downloadHex:", e);
+  }
+}
+
+// Save a catalog .hex directly to the micro:bit via showSaveFilePicker.
+// Fetches the .hex blob, opens the native file picker so the teacher can
+// choose the MICROBIT drive. Falls back to throwing if the API is absent.
+async function saveToMicrobit(programId, programName) {
+  const resp = await fetch(`${API_BASE}/api/catalog/${encodeURIComponent(programId)}`);
+  if (!resp.ok) throw new Error(`Failed to load program (${resp.status})`);
+  const blob = await resp.blob();
+  if (!("showSaveFilePicker" in window)) throw new Error("File picker not available — use Download instead");
+  const handle = await window.showSaveFilePicker({
+    suggestedName: `${programName}.hex`,
+    id: "funconnect-microbit",
+    types: [{ description: "Hex files", accept: { "application/octet-stream": [".hex"] } }],
+  });
+  const writable = await handle.createWritable();
+  await writable.write(blob);
+  await writable.close();
+}
+
+// Direct .hex firmware write for micro:bit — fetches firmware from Edge, tries
+// WebUSB flash first, falls back to MSD (showSaveFilePicker), then download.
+// Every async operation has a timeout; every step is a status-based tripwire
+// node pushed to onProgress so the UI updates incrementally.
+async function saveHexToMicrobit(hexUrl, suggestedName, onProgress) {
+  suggestedName = suggestedName || "relay.hex";
+  var tree = { label: "Flash with FunConnect", status: "in-progress", children: [] };
+  if (onProgress) onProgress(tree);
+  var url = hexUrl || API_BASE + "/api/microbit/relay.hex";
+  var hexBlob;
+
+  // Fetch — timeout after 10s so a slow catalog API doesn't hang the tree
+  var fetchNode = { label: "Fetch firmware", status: "in-progress", children: [] };
+  tree.children.push(fetchNode); if (onProgress) onProgress(tree);
+  try {
+    var resp = await Promise.race([
+      fetch(url),
+      new Promise(function(_, rej) { setTimeout(function() { rej(new Error("fetch timeout after 10s")); }, 10000); })
+    ]);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    hexBlob = await resp.blob();
+    fetchNode.status = "done"; fetchNode.children.push({ label: "Downloaded — " + Math.round(hexBlob.size / 1024) + " KB", status: "done" });
+  } catch (e) {
+    fetchNode.status = "failed"; fetchNode.children.push({ label: "Failed — " + (e.message||e), status: "failed" });
+    tree.status = "failed"; if (onProgress) onProgress(tree); return;
+  }
+
+  // WebUSB flash via DAP.js + nrf-intel-hex (imported from webusb-flash.js)
+  var wTree = await flashViaWebUSB(hexBlob);
+  tree.children.push(wTree);
+  if (wTree.status === "done") { tree.status = "done"; if (onProgress) onProgress(tree); return; }
+
+  // MSD fallback — showSaveFilePicker so the user can drag the file onto the micro:bit
+  var msdNode = { label: "Save to micro:bit (MSD)", status: "in-progress", children: [] };
+  tree.children.push(msdNode); if (onProgress) onProgress(tree);
+  try {
+    var handle = await window.showSaveFilePicker({ suggestedName: suggestedName, startIn: "documents", types: [{ description: "Firmware", accept: { "application/octet-stream": [".hex"] } }] });
+    msdNode.children.push({ label: "Dialog opened", status: "done" });
+    var writable = await handle.createWritable();
+    msdNode.children.push({ label: "Writable created", status: "done" });
+    await writable.write(hexBlob);
+    msdNode.children.push({ label: "Write complete", status: "done" });
+    await writable.close();
+    msdNode.status = "done"; tree.status = "done"; if (onProgress) onProgress(tree); return;
+  } catch (e) {
+    msdNode.children.push({ label: (e.name==="AbortError"?"Cancelled":"Unavailable — "+(e.message||e)), status: "failed" });
+    msdNode.status = "failed";
+  }
+
+  // Download fallback — last resort, triggers a browser download
+  var dlNode = { label: "Download fallback", status: "in-progress", children: [] };
+  tree.children.push(dlNode); if (onProgress) onProgress(tree);
+  var objectUrl = URL.createObjectURL(hexBlob);
+  var a2 = document.createElement("a"); a2.href = objectUrl; a2.download = suggestedName; a2.click();
+  setTimeout(function() { URL.revokeObjectURL(objectUrl); }, 1000);
+  dlNode.children.push({ label: "File saved", status: "done" });
+  dlNode.status = "done"; tree.status = "done"; if (onProgress) onProgress(tree);
+}
+
+// POST /api/chat — Agent AI's RAG pipeline (Edge exposes it). Sends the message +
+// device so the LLM can ground its answer in that device's alerts. Not deployed
+// yet → 404, handled gracefully in the widget. Response shape (best-effort):
+// { reply, context: [ …alerts the answer is grounded in… ] }.
+async function postChat(message, deviceId) {
+  const token = getJwt();
+  const headers = { "content-type": "application/json" };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const r = await fetch(`${API_BASE}/api/chat`, {
+    method: "POST", headers,
+    body: JSON.stringify({ message, device_id: deviceId }),
+  });
+  if (!r.ok) { const e = new Error("chat failed"); e.status = r.status; throw e; }
+  return r.json().catch(() => ({}));
+}
+const SUGGESTED = ["What just happened?", "Is my device okay?", "Show recent alerts."];
+function ctxLabel(c) {
+  if (typeof c === "string") return c;
+  if (!c) return "alert";
+  const cls = c.classification || c.mg?.classification || c.event || "alert";
+  const g = c.impact_g != null ? ` · ${c.impact_g}g` : "";
+  const ago = c.ago ? ` · ${c.ago}` : "";
+  return `${cls}${g}${ago}`;
+}
+
+// Open mBlock in a centered, chrome-minimized window that reads as a dialog,
+// not a browser tab. Browsers cap what we can hide, but this is the max.
+function openMblockPopup() {
+  const w = 1020, h = 700;
+  const baseLeft = window.screenLeft ?? window.screenX ?? 0;
+  const baseTop  = window.screenTop  ?? window.screenY ?? 0;
+  const vw = window.innerWidth  || document.documentElement.clientWidth  || screen.width;
+  const vh = window.innerHeight || document.documentElement.clientHeight || screen.height;
+  const left = Math.max(0, Math.round(baseLeft + (vw - w) / 2));
+  const top  = Math.max(0, Math.round(baseTop  + (vh - h) / 2));
+  const features = [
+    "popup=yes", `width=${w}`, `height=${h}`, `left=${left}`, `top=${top}`,
+    "location=no", "menubar=no", "toolbar=no", "status=no", "resizable=yes", "scrollbars=yes",
+  ].join(",");
+  return window.open(MBLOCK_IDE, "funconnect_mblock", features);
+}
+
+// ---- shared UI ----------------------------------------------------------
+function Stepper({ current }) {
+  const idx = STEPS.findIndex(s => s.key === current);
+  return (
+    <div className="steps">
+      {STEPS.map((s, i) => (
+        <div key={s.key} className={"step " + (i === idx ? "active" : i < idx ? "done" : "")}>
+          <span className="dot">{i < idx ? "✓" : i + 1}</span>
+          {s.label}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function StatusPill({ state, label }) {
+  const cls = state === "ok" ? "ok" : state === "bad" ? "bad" : state === "wait" ? "wait" : "";
+  return <span className={"pill " + cls}><span className="led" />{label}</span>;
+}
+
+// Humanize an age in seconds → "just now" / "12s" / "5m" / "3h" / "2d" ago.
+function humanAgo(secs) {
+  if (secs == null) return "—";
+  if (secs < 5) return "just now";
+  if (secs < 60) return `${secs}s ago`;
+  if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
+  if (secs < 86400) return `${Math.round(secs / 3600)}h ago`;
+  return `${Math.round(secs / 86400)}d ago`;
+}
+
+// Dependency-free confetti burst — celebrates a successful connection.
+function Confetti() {
+  const ref = useRef(null);
+  useEffect(() => {
+    const cv = ref.current; if (!cv) return;
+    const ctx = cv.getContext("2d");
+    const DPR = window.devicePixelRatio || 1;
+    const resize = () => { cv.width = window.innerWidth * DPR; cv.height = window.innerHeight * DPR; };
+    resize();
+    const colors = ["#3db872", "#5ec98f", "#4da6d9", "#f0a030", "#e06060"];
+    const parts = Array.from({ length: 170 }, () => ({
+      x: (window.innerWidth / 2) * DPR, y: (window.innerHeight * 0.34) * DPR,
+      vx: (Math.random() - 0.5) * 15 * DPR, vy: (Math.random() * -13 - 4) * DPR,
+      g: 0.36 * DPR, s: (4 + Math.random() * 6) * DPR, rot: Math.random() * 6.28,
+      vr: (Math.random() - 0.5) * 0.32, c: colors[(Math.random() * colors.length) | 0],
+    }));
+    let raf, start = performance.now();
+    const tick = (now) => {
+      const t = now - start;
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      for (const p of parts) {
+        p.vy += p.g; p.x += p.vx; p.y += p.vy; p.rot += p.vr; p.vx *= 0.99;
+        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+        ctx.globalAlpha = Math.max(0, 1 - t / 2600);
+        ctx.fillStyle = p.c; ctx.fillRect(-p.s / 2, -p.s / 2, p.s, p.s * 0.6);
+        ctx.restore();
+      }
+      if (t < 2600) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    window.addEventListener("resize", resize);
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", resize); };
+  }, []);
+  return <canvas ref={ref} className="confetti-canvas" />;
+}
+
+// A small CyberPi + USB illustration (inline SVG, on-brand).
+function BoardIllustration() {
+  return (
+    <svg width="220" height="120" viewBox="0 0 220 120" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <rect x="86" y="20" width="112" height="80" rx="12" fill="#edf6f0" stroke="#4da6d9" strokeWidth="2"/>
+      <rect x="98" y="32" width="88" height="46" rx="6" fill="#ffffff" stroke="#d4e5da"/>
+      <circle cx="112" cy="55" r="7" fill="#37e0a6"/>
+      <circle cx="132" cy="55" r="7" fill="#2bb3ff"/>
+      <circle cx="152" cy="55" r="7" fill="#ffb454"/>
+      <rect x="104" y="86" width="76" height="6" rx="3" fill="#d4e5da"/>
+      <rect x="10" y="52" width="30" height="16" rx="3" fill="#ffffff" stroke="#3db872" strokeWidth="2"/>
+      <line x1="40" y1="60" x2="86" y2="60" stroke="#37e0a6" strokeWidth="3" strokeDasharray="5 4"/>
+      <path d="M78 55l10 5-10 5z" fill="#37e0a6"/>
+    </svg>
+  );
+}
+
+// ---- Step 0: Device Detection -------------------------------------------
+// Replaces the old Landing screen. Two modes:
+//   Auto-detect — probes the local agent (silent, 1.4s). If found, the
+//     matching card gets a green "Detected" pill.
+//   Manual — both cards always visible. No error state, no spinner forever.
+//     "Looking for devices…" for max 2s, then cards render regardless.
+function DeviceDetection({ agent, onSelect }) {
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    const go = async () => {
+      const found = await detectAgent();
+      if (alive) setChecking(false);
+      // If the agent is present it already knows the device — highlight CyberPi
+      // as the most likely target (agent path is CyberPi-only today).
+    };
+    go();
+    const timeout = setTimeout(() => { if (alive) setChecking(false); }, 2000);
+    return () => { alive = false; clearTimeout(timeout); };
+  }, []);
+
+  const profiles = Object.values(DEVICE_PROFILES);
+
+  return (
+    <div className="card">
+      <h2>Connect a Device</h2>
+      <p className="lead">
+        Choose the device you're connecting. We'll guide you through setup —
+        no brokers, no config files, no manual setup.
+      </p>
+
+      {checking && (
+        <p className="muted" style={{ marginBottom: 18 }}>
+          <span className="spinner" /> Looking for devices…
+        </p>
+      )}
+
+      <div className="grid cols-2" style={{ marginBottom: 18 }}>
+        {profiles.map(p => {
+          const detected = !checking && agent && p.id === "cyberpi";
+          return (
+            <button
+              key={p.id}
+              className="device-card"
+              onClick={() => onSelect(p.id)}
+              style={{
+                display: "flex", flexDirection: "column", gap: 10, padding: 20,
+                background: detected ? "rgba(55,224,166,.06)" : "var(--panel-2)",
+                border: detected ? "1px solid var(--brand)" : "1px solid var(--line)",
+                borderRadius: 14, cursor: "pointer", textAlign: "left",
+                transition: "border-color .15s ease, background .15s ease",
+              }}
+              onMouseEnter={e => { if (!detected) e.currentTarget.style.borderColor = "var(--brand)"; }}
+              onMouseLeave={e => { if (!detected) e.currentTarget.style.borderColor = "var(--line)"; }}
+            >
+              <div className="between">
+                <h3 style={{ margin: 0 }}>{p.name}</h3>
+                {detected && <span className="pill ok">Detected</span>}
+              </div>
+              <p className="muted" style={{ margin: 0, fontSize: 14 }}>{p.description}</p>
+              <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                <span className="tag">{p.connection.method} · {p.connection.tool}</span>
+                <span style={{ color: "var(--brand)", fontSize: 14, fontWeight: 650 }}>Select →</span>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---- Step 1: Landing ----------------------------------------------------
+// (kept for reference — unused in the detection-first flow; may be removed
+//  once multi-device is fully shipped)
+function Landing({ agent, onStart, onViewDashboard }) {
+  return (
+    <div className="card">
+      <h2>Turn Your CyberPi Into a Live Device</h2>
+      <p className="lead">
+        Pick a program, flash it to your CyberPi, and watch its sensors stream live — no brokers,
+        no config files, no manual setup. It takes about a minute.
+      </p>
+
+      <div className="grid cols-2" style={{ marginBottom: 18 }}>
+        <div className="stat">
+          <div className="k">What you need</div>
+          <div className="v" style={{ fontSize: 16 }}>A CyberPi + USB cable</div>
+          <p className="muted" style={{ marginTop: 8 }}>
+            Plus <b>mLink2</b>, the free helper that lets mBlock talk to your board.{" "}
+            <a href={MLINK_DOWNLOAD} target="_blank" rel="noreferrer">Get mLink2 ↗</a>
+          </p>
+        </div>
+        <div className="stat">
+          <div className="k">Upload method</div>
+          <div className="v" style={{ fontSize: 16 }}>
+            {agent ? "Fast Deploy" : "Guided (mBlock)"}
+          </div>
+          <p className="muted" style={{ marginTop: 8 }}>
+            {agent
+              ? "FunConnect agent detected — we'll flash your board in one click, no popup."
+              : "We'll open the mBlock editor in a focused window and guide you through the upload."}
+          </p>
+        </div>
+      </div>
+
+      <div className="row" style={{ marginBottom: 18 }}>
+        {agent
+          ? <StatusPill state="ok" label="FunConnect Agent Detected" />
+          : <StatusPill state="wait" label="Guided Upload Mode" />}
+      </div>
+
+      <hr className="hr" />
+      <div className="between">
+        <button className="btn ghost" onClick={onViewDashboard}>View Dashboard →</button>
+        <button className="btn" onClick={onStart}>Get Started →</button>
+      </div>
+    </div>
+  );
+}
+
+// ---- Micro:bit Save Overlay — guide → picker → done --------------------
+function MicrobitSaveOverlay({ program, onClose, onDone }) {
+  const [phase, setPhase] = useState("guide"); // guide | saving | done | error
+  const [errMsg, setErrMsg] = useState(null);
+
+  const handleSave = async () => {
+    setPhase("saving");
+    try {
+      await saveToMicrobit(program.id, program.name);
+      setPhase("done");
+    } catch (e) {
+      if (e.name === "AbortError") { setPhase("guide"); return; }
+      setErrMsg(e.message || "Could not save");
+      setPhase("error");
+    }
+  };
+
+  return (
+    <div className="overlay-full">
+      <div className="modal" style={{ maxWidth: 460 }}>
+        <div className="modal-head">
+          <div>
+            <div className="eyebrow">Save to micro:bit</div>
+            <h2 style={{ margin: 0, fontSize: 20 }}>{program.name}</h2>
+          </div>
+          <button className="x" onClick={onClose} aria-label="Close">✕</button>
+        </div>
+
+        {phase === "guide" && (
+          <div style={{ textAlign: "center" }}>
+            <div style={{
+              margin: "0 auto 18px", border: "2px dashed var(--line)",
+              borderRadius: 12, padding: 40, color: "var(--muted)",
+              fontSize: 14, maxWidth: 320,
+            }}>
+              Picture coming soon
+            </div>
+            <p style={{ fontSize: 15, lineHeight: 1.5, margin: "0 0 18px", color: "var(--muted)" }}>
+              Your program is ready. Click below, then choose your <b>MICROBIT</b> drive.
+            </p>
+            <button className="btn lg" onClick={handleSave}>
+              Save to micro:bit →
+            </button>
+            <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>
+              File pre-named: {program.name}.hex
+            </p>
+          </div>
+        )}
+
+        {phase === "saving" && (
+          <div style={{ textAlign: "center", padding: "20px 0" }}>
+            <div className="pulsebar">
+              <span className="pulsedot" /> Writing to micro:bit…
+            </div>
+            <p className="muted" style={{ fontSize: 13, marginTop: 8 }}>
+              Save the file to your MICROBIT drive in the dialog.
+            </p>
+          </div>
+        )}
+
+        {phase === "done" && (
+          <div className="success-burst" style={{ textAlign: "center" }}>
+            <div className="ring">✓</div>
+            <p style={{ fontSize: 15, margin: "12px 0" }}>
+              <b>{program.name}</b> is on your micro:bit!<br />
+              Look at the LEDs.
+            </p>
+            <button className="btn" onClick={onDone}>Pick another →</button>
+          </div>
+        )}
+
+        {phase === "error" && (
+          <div style={{ textAlign: "center" }}>
+            <p className="err" style={{ fontSize: 15, marginBottom: 18 }}>
+              Couldn't save: {errMsg}
+            </p>
+            <div className="row" style={{ gap: 10, justifyContent: "center" }}>
+              <button className="btn" onClick={handleSave}>Try again →</button>
+              <button className="btn ghost"
+                onClick={() => { downloadHex(program.id, program.name); onClose(); }}>
+                ↓ Download .hex instead
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---- Step 2: Catalog ----------------------------------------------------
+function Catalog({ deviceType, selected, onSelect, onDeploy, onSkip }) {
+  const [items, setItems] = useState(null);
+  const [err, setErr] = useState(null);
+  const [overlay, setOverlay] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    getCatalog().then(d => alive && setItems(d)).catch(e => alive && setErr(e.message));
+    return () => { alive = false; };
+  }, []);
+
+  const profile = deviceType ? DEVICE_PROFILES[deviceType] : null;
+  const filtered = profile && items
+    ? items.filter(p => p.tags && p.tags.includes(profile.catalogTag))
+    : items;
+  const header = profile ? `Programs for ${profile.name}` : "Pick a Program";
+
+  return (
+    <>
+    <div className="card">
+      <h2>{header}</h2>
+      <p className="lead">These run on your {profile ? profile.name : "device"}. Choose one, then deploy — we'll walk you through it.</p>
+
+      {err && <p className="err">Couldn't load the catalog: {err}</p>}
+      {!items && !err && <p className="muted"><span className="spinner" /> Loading programs…</p>}
+
+      {items && filtered && filtered.length === 0 && (
+        <p className="muted" style={{ marginBottom: 14 }}>No programs available for this device yet.</p>
+      )}
+
+      {filtered && (
+        <div className="catalog">
+          {filtered.map(p => (
+            <div key={p.id}
+                 className={"prog " + (selected?.id === p.id ? "selected" : "")}
+                 onClick={() => onSelect(p)}
+                 onDoubleClick={() => { onSelect(p); if (!profile || !profile.deploy || profile.deploy.programFormat !== ".hex") onDeploy(); }}>
+              <h3>{p.name} <span className="ver">v{p.version}</span></h3>
+              <p>{p.description}</p>
+              {Array.isArray(p.tags) && p.tags.length > 0 && (
+                <div className="tags">{p.tags.map(t => <span key={t} className="tag">{t}</span>)}</div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <hr className="hr" />
+      <div className="between">
+        <span className="muted">{selected ? <>Selected: <b>{selected.name}</b></> : "Nothing selected yet"}</span>
+        {(profile && profile.deploy && profile.deploy.programFormat === ".hex") || (selected && selected.format === ".hex") ? (
+          <div className="row" style={{ gap: 8 }}>
+            <button className="btn ghost" onClick={onSkip}>Skip to Dashboard →</button>
+            <button className="btn" disabled={!selected}
+              onClick={() => selected && setOverlay(selected)}>
+              Save to micro:bit →
+            </button>
+            <button className="btn ghost" disabled={!selected}
+              onClick={() => selected && downloadHex(selected.id, selected.name)}>
+              ↓ Download .hex
+            </button>
+          </div>
+        ) : (
+          <div className="row">
+            <button className="btn ghost" onClick={onSkip}>Skip to Dashboard →</button>
+            <button className="btn" disabled={!selected} onClick={onDeploy}>Deploy →</button>
+          </div>
+        )}
+      </div>
+    </div>
+    {overlay && <MicrobitSaveOverlay program={overlay} onClose={() => setOverlay(null)} onDone={() => { setOverlay(null); onSelect(null); }} />}
+    </>
+  );
+}
+
+// ---- Step 3: Deploy (bank-grade overlay) --------------------------------
+function Deploy({ deviceType, program, deviceId, setDeviceId, agent, onLive, onCancel, toast }) {
+  const [sub, setSub] = useState(0);            // 0 connect · 1 open mBlock · 2 upload
+  const [src, setSrc] = useState(null);
+  const [status, setStatus] = useState(null);
+  const [connected, setConnected] = useState(false);
+  const [popupOpen, setPopupOpen] = useState(false);
+  const popupRef = useRef(null);
+  const doneRef = useRef(false);
+
+  // Preload the program source for copy/download.
+  useEffect(() => {
+    let alive = true;
+    getProgramSource(program.id).then(t => alive && setSrc(t)).catch(() => {});
+    return () => { alive = false; };
+  }, [program.id]);
+
+  // Path B: hand the deploy to the local agent via the Worker (fire & forget).
+  useEffect(() => {
+    if (!agent) return;
+    fetch(`${API_BASE}/api/device/${encodeURIComponent(deviceId)}/deploy`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ program_id: program.id }),
+    }).catch(() => {});
+  }, [agent, deviceId, program.id]);
+
+  // Poll status — for the agent path immediately, for the popup path once the
+  // user has started uploading (sub ≥ 2). When online: confetti → dashboard.
+  useEffect(() => {
+    if (!agent && sub < 2) return;
+    let alive = true;
+    const poll = async () => {
+      try {
+        const s = await getDeviceStatus(deviceId);
+        if (!alive) return;
+        setStatus(s);
+        if (s.online && !doneRef.current) {
+          doneRef.current = true;
+          setConnected(true);
+          try { if (popupRef.current && !popupRef.current.closed) popupRef.current.close(); } catch {}
+          setTimeout(() => alive && onLive(), 2600);
+        }
+      } catch {}
+    };
+    poll();
+    const iv = setInterval(poll, 5000);          // Edge spec: every 5s
+    return () => { alive = false; clearInterval(iv); };
+  }, [agent, sub, deviceId, onLive]);
+
+  // Notice if the user closes the mBlock window before the device is online.
+  useEffect(() => {
+    if (!popupOpen) return;
+    const iv = setInterval(() => {
+      if (popupRef.current && popupRef.current.closed) { setPopupOpen(false); clearInterval(iv); }
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [popupOpen]);
+
+  const openPopup = () => {
+    const p = openMblockPopup();
+    if (!p) { toast("Your browser blocked the window — allow pop-ups for this site, then try again."); return; }
+    popupRef.current = p;
+    setPopupOpen(true);
+    setSub(2);
+    try { p.focus(); } catch {}
+  };
+
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(src || ""); toast("Code copied — paste it into mBlock."); }
+    catch { toast("Couldn't auto-copy — use the Download button instead."); }
+  };
+  const download = () => {
+    const b = new Blob([src || ""], { type: "text/x-python" });
+    const u = URL.createObjectURL(b);
+    const a = document.createElement("a");
+    a.href = u; a.download = `${program.id}.py`; a.click();
+    URL.revokeObjectURL(u);
+  };
+
+  // --- success screen ---
+  if (connected) {
+    return (
+      <div className="overlay-full">
+        <div className="modal connected-screen">
+          <div className="ring-xl">✓</div>
+          <h2 style={{ fontSize: 24, margin: "6px 0" }}>Your Device Is Online</h2>
+          <p className="muted" style={{ fontSize: 16 }}>
+            <b>{deviceId}</b> is connected and streaming. Taking you to the live dashboard…
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // --- Path B: agent deploy (no popup) ---
+  if (agent) {
+    return (
+      <Shell program={program} onCancel={onCancel} sub={2} labels={["Connect", "Deploy", "Go live"]}>
+        <div className="substep" style={{ textAlign: "center" }}>
+          <div className="illus"><BoardIllustration /></div>
+          <h3>Deploying to Your CyberPi</h3>
+          <p>The FunConnect agent is flashing <b>{program.name}</b> — no popup needed. Keep this page open.</p>
+          <div className="pulsebar"><span className="pulsedot" /> Upload in Progress…</div>
+          <div className="waiting"><span className="spinner" /> Waiting for <b>&nbsp;{deviceId}&nbsp;</b> to come online
+            {status && <span className="muted"> · {status.telemetry_count ?? 0} packets</span>}
+          </div>
+        </div>
+      </Shell>
+    );
+  }
+
+  // --- Path A: popup flow ---
+  return (
+    <Shell program={program} onCancel={onCancel} sub={sub} labels={["Connect", "Open mBlock", "Upload"]}>
+      {sub === 0 && (
+        <div className="substep">
+          <div className="illus"><BoardIllustration /></div>
+          <h3>Connect Your CyberPi</h3>
+          <p>
+            Plug your CyberPi into this computer with the USB cable and switch it on. Make sure
+            <b> mLink2</b> is installed so mBlock can see it. <a href={MLINK_DOWNLOAD} target="_blank" rel="noreferrer">Get mLink2 ↗</a>
+          </p>
+          <button className="btn lg" onClick={() => setSub(1)}>My CyberPi Is Plugged In →</button>
+        </div>
+      )}
+
+      {sub === 1 && (
+        <div className="substep">
+          <h3>Open mBlock</h3>
+          <p>
+            We'll open the mBlock editor in a focused window. You'll upload your program there,
+            then come straight back — this page keeps waiting for your device.
+          </p>
+          <div style={{ marginBottom: 18 }}>
+            <label className="lbl">Device name — this is how your dashboard finds the board</label>
+            <input type="text" value={deviceId} onChange={e => setDeviceId(e.target.value)} />
+            <p className="muted" style={{ fontSize: 13, marginTop: 6 }}>Default is <b>cyberpi</b>. Leave it unless you renamed the device.</p>
+          </div>
+          <button className="btn lg" onClick={openPopup}>Open mBlock →</button>
+          <button className="btn ghost block" style={{ marginTop: 10 }} onClick={() => setSub(0)}>← Back</button>
+        </div>
+      )}
+
+      {sub === 2 && (
+        <div className="substep">
+          <div className="pulsebar"><span className="pulsedot" /> Upload in Progress — finish in the mBlock window</div>
+          <h3>Upload Your Program</h3>
+          <p style={{ marginBottom: 14 }}>In the mBlock window, do these three things:</p>
+          <div className="mini">
+            <div className="m"><span className="mn">1</span><div>Switch mBlock to <b>Python</b> mode (top-right toggle).</div></div>
+            <div className="m"><span className="mn">2</span>
+              <div>Clear the editor and <b>paste your program</b>.
+                <div className="row" style={{ marginTop: 8 }}>
+                  <button className="btn sm" onClick={copy} disabled={!src}>Copy Code</button>
+                  <button className="btn sm ghost" onClick={download} disabled={!src}>Download .py</button>
+                </div>
+              </div>
+            </div>
+            <div className="m"><span className="mn">3</span><div>Click <b>Upload</b> (not Run). Your board reboots and connects.</div></div>
+          </div>
+
+          <div className="waiting"><span className="spinner" /> Waiting for <b>&nbsp;{deviceId}&nbsp;</b> to come online
+            {status && <span className="muted"> · {status.telemetry_count ?? 0} packets</span>}
+          </div>
+
+          {!popupOpen && (
+            <button className="btn ghost block" style={{ marginTop: 14 }} onClick={openPopup}>
+              Reopen mBlock Window
+            </button>
+          )}
+        </div>
+      )}
+    </Shell>
+  );
+}
+
+// The bank-grade overlay chrome shared by every deploy sub-step.
+function Shell({ program, onCancel, sub, labels, children }) {
+  return (
+    <div className="overlay-full">
+      <div className="modal">
+        <div className="modal-head">
+          <div>
+            <div className="eyebrow">Deploy</div>
+            <h2 style={{ margin: 0, fontSize: 20 }}>{program.name}</h2>
+          </div>
+          <button className="x" onClick={onCancel} aria-label="Cancel deploy">✕</button>
+        </div>
+        <div className="progress-dots">
+          {labels.map((lb, i) => (
+            <span key={lb} className={"dot-lg " + (i === sub ? "active" : i < sub ? "done" : "")}>
+              {i < sub ? "✓" : i + 1}
+            </span>
+          ))}
+          <span className="stepcount">Step {Math.min(sub + 1, labels.length)} of {labels.length}</span>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// ---- Alerts: Madgwick display -------------------------------------------
+// Color-coded per Alpha's spec.
+const CLASS_STYLE = {
+  crash:     { fg: "#ff6b6b", bg: "rgba(255,107,107,.14)", br: "rgba(255,107,107,.5)" },
+  bump:      { fg: "#ffb454", bg: "rgba(255,180,84,.14)",  br: "rgba(255,180,84,.5)" },
+  tilt:      { fg: "#ffd54a", bg: "rgba(255,213,74,.14)",  br: "rgba(255,213,74,.5)" },
+  freefall:  { fg: "#b98cff", bg: "rgba(185,140,255,.16)", br: "rgba(185,140,255,.5)" },
+  vibration: { fg: "#2bb3ff", bg: "rgba(43,179,255,.14)",  br: "rgba(43,179,255,.5)" },
+  unknown:   { fg: "#8a99ad", bg: "rgba(138,153,173,.14)", br: "rgba(138,153,173,.45)" },
+};
+
+// Normalize a raw WS alert into a stable shape. madgwick_json may arrive as a
+// JSON string (D1 column) or an already-parsed object; null for pre-migration
+// alerts. Returns mg=null when unavailable → UI shows "Processing…".
+function normalizeAlert(m) {
+  let mg = m.madgwick_json ?? m.madgwick ?? null;
+  if (typeof mg === "string") { try { mg = JSON.parse(mg); } catch { mg = null; } }
+  return {
+    id: m.id ?? m.do_ms ?? m.doTs ?? `${m.signature}-${m.accel_peak}`,
+    ts: m.do_ms ?? m.doTs ?? Date.now(),
+    event: m.event ?? null,
+    accel_peak: m.accel_peak ?? null,
+    omega_peak: m.omega_peak ?? null,
+    signature: m.signature ?? null,
+    mg,
+  };
+}
+
+function ClassBadge({ classification }) {
+  const key = (classification || "unknown").toLowerCase();
+  const s = CLASS_STYLE[key] || CLASS_STYLE.unknown;
+  return (
+    <span className="class-badge" style={{ color: s.fg, background: s.bg, borderColor: s.br }}>
+      <span className="cbdot" style={{ background: s.fg }} />{key}
+    </span>
+  );
+}
+
+// A small horizontal angle gauge centered at 0°, range ±90°.
+function AngleGauge({ label, value }) {
+  const v = Number(value) || 0;
+  const pct = 50 + Math.max(-90, Math.min(90, v)) / 90 * 50;
+  return (
+    <div className="gauge">
+      <div className="gauge-top"><span>{label}</span><b>{v.toFixed(1)}°</b></div>
+      <div className="gauge-track"><span className="gauge-zero" /><span className="gauge-fill" style={{ left: `${Math.min(50, pct)}%`, width: `${Math.abs(pct - 50)}%` }} /></div>
+    </div>
+  );
+}
+
+function AlertDetail({ alert }) {
+  if (!alert) return null;
+  const { mg } = alert;
+  const impact = mg && mg.a_trans
+    ? Math.sqrt((mg.a_trans.x || 0) ** 2 + (mg.a_trans.y || 0) ** 2 + (mg.a_trans.z || 0) ** 2)
+    : null;
+
+  return (
+    <div className="alert-detail">
+      {mg ? (
+        <>
+          <div className="between" style={{ marginBottom: 14 }}>
+            <ClassBadge classification={mg.classification} />
+            {mg.freefall && <span className="class-badge" style={{ color: CLASS_STYLE.freefall.fg, background: CLASS_STYLE.freefall.bg, borderColor: CLASS_STYLE.freefall.br }}>free-fall</span>}
+          </div>
+
+          <div className="grid cols-2" style={{ marginBottom: 14 }}>
+            <div className="stat">
+              <div className="k">Impact</div>
+              <div className="v">{impact === null ? "—" : impact.toFixed(1)}<span className="u"> g</span></div>
+            </div>
+            <div className="stat">
+              <div className="k">Signature</div>
+              <div className="v" style={{ fontSize: 20 }}>{alert.signature ?? "—"}</div>
+            </div>
+          </div>
+
+          <AngleGauge label="Roll" value={mg.roll} />
+          <AngleGauge label="Pitch" value={mg.pitch} />
+
+          <div className="row" style={{ marginTop: 12, gap: 16 }}>
+            <span className="muted">Accel peak: <b>{alert.accel_peak ?? "—"}</b> g</span>
+            <span className="muted">Omega peak: <b>{alert.omega_peak ?? "—"}</b> °/s</span>
+          </div>
+        </>
+      ) : (
+        <div className="row" style={{ gap: 10, color: "var(--muted)" }}>
+          <span className="spinner" /> Madgwick processing… (this alert predates the upgrade or is still being analyzed)
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- Chat widget (Agent AI RAG) -----------------------------------------
+function ChatWidget({ deviceId }) {
+  const [open, setOpen] = useState(true);
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const logRef = useRef(null);
+
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [messages, busy, open]);
+
+  const send = async (text) => {
+    const msg = (text != null ? text : input).trim();
+    if (!msg || busy) return;
+    setInput("");
+    setMessages(m => [...m, { role: "user", text: msg }]);
+    setBusy(true);
+    try {
+      const r = await postChat(msg, deviceId);
+      const reply = r.reply || r.answer || r.response || r.message || "I'm not sure how to answer that.";
+      const context = r.context || r.sources || r.alerts || [];
+      setMessages(m => [...m, { role: "bot", text: reply, context }]);
+    } catch (e) {
+      const text = e.status === 404
+        ? "The assistant isn't switched on yet — check back soon!"
+        : "Sorry, I couldn't reach the assistant. Please try again.";
+      setMessages(m => [...m, { role: "bot", text, error: true }]);
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="card">
+      <div className="between" style={{ marginBottom: open ? 12 : 0 }}>
+        <h3 style={{ margin: 0 }}>Ask FunConnect</h3>
+        <button className="btn ghost sm" onClick={() => setOpen(o => !o)}>{open ? "Hide" : "Show"}</button>
+      </div>
+
+      {open && (
+        <div className="chat">
+          <div className="chat-log" ref={logRef}>
+            {messages.length === 0 && (
+              <div className="msg bot">Hi! Ask me what happened, whether your device is okay, or to show recent alerts.</div>
+            )}
+            {messages.map((m, i) => (
+              <div key={i} className={"msg " + m.role + (m.error ? " error" : "")}>
+                {m.text}
+                {m.role === "bot" && !m.error && (
+                  (m.context && m.context.length)
+                    ? <div className="chat-ctx">{m.context.map((c, j) => <span key={j} className="cx">{ctxLabel(c)}</span>)}</div>
+                    : <div className="chat-empty">No disturbances detected yet — try shaking the device!</div>
+                )}
+              </div>
+            ))}
+            {busy && <div className="msg bot"><span className="typing"><i /><i /><i /></span></div>}
+          </div>
+
+          <div className="suggest">
+            {SUGGESTED.map(q => (
+              <button key={q} className="btn ghost sm" disabled={busy} onClick={() => send(q)}>{q}</button>
+            ))}
+          </div>
+
+          <form className="chat-input" onSubmit={e => { e.preventDefault(); send(); }}>
+            <input type="text" value={input} placeholder="Ask about your device…" disabled={busy}
+                   onChange={e => setInput(e.target.value)} />
+            <button className="btn" type="submit" disabled={busy || !input.trim()}>Send</button>
+          </form>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- Step 4: Dashboard --------------------------------------------------
+function Dashboard({ deviceId, setDeviceId, follow = true, showDeviceControls = true, deviceType = "cyberpi" }) {
+  const [tele, setTele] = useState(null);
+  const [wsUp, setWsUp] = useState(false);
+  const [wsTried, setWsTried] = useState(false);
+  const [status, setStatus] = useState(null);
+  const [lastAt, setLastAt] = useState(null);
+  const [alerts, setAlerts] = useState([]);
+  const [selId, setSelId] = useState(null);
+  const [auto, setAuto] = useState(follow);        // follow live device by default (public); admin pins a selection
+  const [discovered, setDiscovered] = useState(null);
+  const wsRef = useRef(null);
+  const [relayActive, setRelayActive] = useState(false);
+  const [rememberedPorts, setRememberedPorts] = useState(0);
+  const [buttons, setButtons] = useState({ a: false, b: false });  // micro:bit button state
+  const [ledPattern, setLedPattern] = useState("clear");           // micro:bit LED preview
+  const ledQueueRef = useRef([]);                                   // outbound LED command queue
+  const ledBusyRef = useRef(false);                                 // guard against interleaved sends
+  const ledTimerRef = useRef(null);                                 // drain timer
+
+  // Drain the LED command queue — sends one command every 1.5s so the
+  // micro:bit's 64-byte RX buffer and char-by-char reader never overlap.
+  const sendLedCommand = useCallback((pattern) => {
+    setLedPattern(pattern); // optimistic preview
+    ledQueueRef.current.push(pattern);
+    if (ledBusyRef.current) return;
+    const drain = () => {
+      if (ledQueueRef.current.length === 0) {
+        ledBusyRef.current = false;
+        return;
+      }
+      ledBusyRef.current = true;
+      const next = ledQueueRef.current.shift();
+      sendToDevice(JSON.stringify({ command: "led_matrix", pattern: next }));
+      ledTimerRef.current = setTimeout(drain, 1500);
+    };
+    drain();
+  }, []);
+
+  // Listen for relay connection/disconnect events from BroadcastChannel.
+  useEffect(() => {
+    let channel;
+    try {
+      channel = new BroadcastChannel("relay");
+      channel.onmessage = (event) => {
+        if (event.data.type === "connected") setRelayActive(true);
+        if (event.data.type === "disconnected") setRelayActive(false);
+      };
+    } catch {}
+    return () => { try { channel && channel.close(); } catch {} };
+  }, []);
+
+  // Check for previously authorized serial ports — enables reconnect hint.
+  useEffect(() => {
+    if (typeof navigator !== "undefined" && navigator.serial && navigator.serial.getPorts) {
+      navigator.serial.getPorts().then(ports => setRememberedPorts(ports.length)).catch(() => {});
+    }
+  }, []);
+
+  // Effective device: newest discovered when auto-following, else the manual id.
+  // discovered is [{device_id, device_type}] — extract the id for WS/polling, type for panels.
+  const discoveredEntry = (auto && discovered && discovered[0]) ? discovered[0] : null;
+  const dev = discoveredEntry ? discoveredEntry.device_id : deviceId;
+  const discoveredType = discoveredEntry ? discoveredEntry.device_type : null;
+  // Prefer API-provided device_type, fall back to prop, then default.
+  const effectiveType = discoveredType || deviceType;
+  const profile = DEVICE_PROFILES[effectiveType] || DEVICE_PROFILES.cyberpi;
+  const panel = profile.telemetry.dashboardPanel;
+
+
+
+  // Auto-discovery: find the live device (verifying liveness, since /api/devices
+  // flags lag rotation) and follow it. Re-probes every 15s so a rotation is
+  // picked up within one cycle. Falls back to `deviceId` when nothing is live.
+  useEffect(() => {
+    if (!auto) return;
+    let alive = true;
+    const tick = async () => {
+      const live = await discoverLiveDevice(deviceId);
+      if (alive && live) setDiscovered([live]);  // {device_id, device_type}
+    };
+    tick();
+    const iv = setInterval(tick, 15000);
+    return () => { alive = false; clearInterval(iv); };
+  }, [auto, deviceId]);
+
+  // Live telemetry + alert stream for the effective device.
+  useEffect(() => {
+    setTele(null); setAlerts([]); setSelId(null);   // reset when the device changes
+    let alive = true, reconnect;
+    const connect = () => {
+      try {
+        const ws = new WebSocket(`${WS_BASE}/dashboard/${encodeURIComponent(dev)}`);
+        wsRef.current = ws;
+        ws.onopen = () => alive && (setWsUp(true), setWsTried(true));
+        ws.onmessage = ev => {
+          if (!alive) return;
+          try {
+            const m = JSON.parse(ev.data);
+            if (m.type === "state" && m.telemetry) { setTele(m.telemetry); setLastAt(Date.now()); if (m.buttons) setButtons(m.buttons); }
+            if (m.type === "alert") {
+              const a = normalizeAlert(m);
+              setAlerts(prev => [a, ...prev.filter(x => x.id !== a.id)].slice(0, 20));
+              setSelId(a.id);           // focus the freshest alert
+            }
+          } catch {}
+        };
+        ws.onclose = () => { if (!alive) return; setWsUp(false); setWsTried(true); reconnect = setTimeout(connect, 5000); };
+        ws.onerror = () => { try { ws.close(); } catch {} };
+      } catch { setWsTried(true); }
+    };
+    connect();
+    return () => { alive = false; clearTimeout(reconnect); try { wsRef.current?.close(); } catch {} };
+  }, [dev]);
+
+  useEffect(() => {
+    let alive = true;
+    const poll = async () => { try { const s = await getDeviceStatus(dev); if (alive) setStatus(s); } catch {} };
+    poll();
+    const iv = setInterval(poll, 5000);
+    return () => { alive = false; clearInterval(iv); };
+  }, [dev]);
+
+  // Trust live WS frames over the (often-lagging) status fields: if state frames
+  // are arriving, the device is online now regardless of what D1 reports.
+  const liveRecent = lastAt && (Date.now() - lastAt < 60000);
+  const online = status?.online || liveRecent;
+  const tilt = tele ? Number(tele.tilt || 0) : 0;
+  const vib  = tele ? Number(tele.vibration || 0) : 0;
+  const fmt = (v, d = 2) => (v === undefined || v === null || isNaN(v) ? "—" : Number(v).toFixed(d));
+  const lastMs = lastAt || status?.last_seen_ms || null;
+  const secsAgo = lastMs ? Math.max(0, Math.round((Date.now() - lastMs) / 1000)) : null;
+  const selected = alerts.find(a => a.id === selId) || alerts[0] || null;
+  const relTime = (ts) => humanAgo(Math.max(0, Math.round((Date.now() - ts) / 1000)));
+
+  return (
+    <div className="grid">
+      <div className="card">
+        <div className="between" style={{ flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <h2 style={{ marginBottom: 6 }}>Live Dashboard</h2>
+            <div className="row" style={{ gap: 8, alignItems: "center" }}>
+              <span className="muted" style={{ fontSize: 13 }}>Device</span>
+              {showDeviceControls ? (
+                <>
+                  <input className="dev-input" type="text" value={dev} spellCheck={false}
+                         onChange={e => { setAuto(false); setDeviceId && setDeviceId(e.target.value); }} />
+                  <button className="btn sm ghost" onClick={() => setAuto(true)} disabled={auto}>Auto</button>
+                </>
+              ) : (
+                <b style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 13 }}>{dev}</b>
+              )}
+            </div>
+          </div>
+          <div className="row">
+            {showDeviceControls && (
+              <StatusPill state={auto ? (discovered ? "ok" : "wait") : "wait"}
+                          label={!auto ? "Manual" : discovered ? "Auto-following" : "Auto · discovery pending"} />
+            )}
+            <StatusPill state={online ? "ok" : "bad"} label={online ? "Device Online" : "Offline"} />
+            <StatusPill state={wsUp ? "ok" : "wait"} label={wsUp ? "Live Stream Connected" : "Live Stream Pending"} />
+            {relayActive && (
+              <>
+                <StatusPill state="ok" label="USB Relay Active" />
+                <button className="btn ghost sm" style={{ marginLeft: 6, fontSize: 11, color: "var(--bad)" }}
+                  onClick={() => { disconnectRelay(); setRelayActive(false); }}>
+                  Disconnect
+                </button>
+              </>
+            )}
+            {!relayActive && rememberedPorts > 0 && (
+              <span className="muted" style={{ fontSize: 12, marginLeft: 6 }}>
+                Relay disconnected — return to <b>Connect</b> tab to reconnect.
+              </span>
+            )}
+          </div>
+        </div>
+        {!wsUp && wsTried && (
+          <p className="muted" style={{ marginTop: 10, fontSize: 12.5 }}>
+            Live stream disconnected — showing polled health and retrying. IMU gauges resume the moment
+            a device streams <code>state</code> frames.
+          </p>
+        )}
+      </div>
+
+      {panel === "imu" && (
+        <>
+          <div className="grid cols-2">
+            <div className="card">
+              <h3 style={{ marginBottom: 12 }}>Orientation</h3>
+              <div className="tiltbox">
+                <div className="horizon">
+                  <div className="plane" style={{ transform: `rotate(${Math.max(-60, Math.min(60, tilt))}deg)` }} />
+                </div>
+              </div>
+              <div className="row" style={{ marginTop: 12, justifyContent: "space-between" }}>
+                <div className="stat" style={{ flex: 1 }}><div className="k">Tilt</div><div className="v">{fmt(tilt, 1)}<span className="u">°</span></div></div>
+                <div className="stat" style={{ flex: 1 }}><div className="k">Vibration</div><div className="v">{fmt(vib, 2)}</div></div>
+              </div>
+            </div>
+
+            <div className="card">
+              <h3 style={{ marginBottom: 12 }}>Motion (IMU)</h3>
+              <div className="grid" style={{ gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+                {[["acc_x","Acc X"],["acc_y","Acc Y"],["acc_z","Acc Z"],["gyro_x","Gyro X"],["gyro_y","Gyro Y"],["gyro_z","Gyro Z"]].map(([k, label]) => (
+                  <div className="stat" key={k}><div className="k">{label}</div><div className="v" style={{ fontSize: 20 }}>{fmt(tele?.[k], 2)}</div></div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="grid cols-2">
+            <div className="stat"><div className="k">Telemetry packets</div><div className="v">{status?.telemetry_count ?? "—"}</div></div>
+            <div className="stat">
+              <div className="k">Last seen</div>
+              <div className="v" style={{ fontSize: 20 }}>{humanAgo(secsAgo)}</div>
+              {lastAt && <div className="u" style={{ marginTop: 4 }}>live frame received</div>}
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="between" style={{ marginBottom: 12 }}>
+              <h3 style={{ margin: 0 }}>Disturbance Alerts</h3>
+              <span className="muted" style={{ fontSize: 13 }}>{alerts.length ? `${alerts.length} recent` : "live"}</span>
+            </div>
+
+            {alerts.length === 0 ? (
+              <p className="muted" style={{ margin: 0 }}>No alerts yet — shake the device to trigger one.</p>
+            ) : (
+              <div className="alert-layout">
+                <div className="alert-list">
+                  {alerts.map(a => {
+                    const cls = (a.mg?.classification || "unknown").toLowerCase();
+                    const st = CLASS_STYLE[cls] || CLASS_STYLE.unknown;
+                    return (
+                      <button key={a.id} className={"alert-row " + (selected?.id === a.id ? "sel" : "")} onClick={() => setSelId(a.id)}>
+                        <span className="ar-dot" style={{ background: a.mg ? st.fg : "var(--muted)" }} />
+                        <span className="ar-cls">{a.mg ? cls : "processing"}</span>
+                        <span className="ar-meta">{a.accel_peak != null ? `${a.accel_peak}g` : "—"}</span>
+                        <span className="ar-time">{relTime(a.ts)}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+                <AlertDetail alert={selected} />
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {panel === "microbit" && (
+        <>
+          {/* LED Matrix preview + pattern buttons */}
+          <div className="card">
+            <h3 style={{ marginBottom: 12 }}>LED Matrix</h3>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 28px)", gap: 4, justifyContent: "center", marginBottom: 14 }}>
+              {(LED_PATTERNS[ledPattern] || LED_PATTERNS.clear).map((v, i) => (
+                <div key={i} style={{
+                  width: 24, height: 24, borderRadius: "50%",
+                  background: v ? "var(--brand)" : "var(--line)",
+                  boxShadow: v ? "0 0 8px var(--brand)" : "none",
+                  transition: "background .15s, box-shadow .15s",
+                }} />
+              ))}
+            </div>
+            <div className="row" style={{ gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+              {[
+                { pattern: "heart", label: "❤️ Heart" },
+                { pattern: "smile", label: "😊 Smile" },
+                { pattern: "sad",   label: "😢 Sad" },
+                { pattern: "star",  label: "⭐ Star" },
+                { pattern: "clear", label: "🗑️ Clear" },
+              ].map(({ pattern, label }) => (
+                <button key={pattern} className="btn sm"
+                  onClick={() => sendLedCommand(pattern)}
+                  style={{ fontSize: 13, padding: "6px 12px" }}
+                >{label}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Sensors: buttons + temperature + accelerometer */}
+          <div className="grid cols-2">
+            <div className="card">
+              <h3 style={{ marginBottom: 12 }}>Buttons</h3>
+              <div className="row" style={{ gap: 16 }}>
+                <div>
+                  <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>Button A</div>
+                  <StatusPill state={buttons.a ? "ok" : "muted"} label={buttons.a ? "pressed" : "released"} />
+                </div>
+                <div>
+                  <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>Button B</div>
+                  <StatusPill state={buttons.b ? "ok" : "muted"} label={buttons.b ? "pressed" : "released"} />
+                </div>
+              </div>
+            </div>
+            <div className="card">
+              <h3 style={{ marginBottom: 12 }}>Temperature</h3>
+              {(() => {
+                const t = tele?.temp != null ? Number(tele.temp) : null;
+                if (t === null) return <span className="muted">—</span>;
+                const pct = Math.max(0, Math.min(100, ((t - 10) / 30) * 100));
+                const hue = 240 - (pct / 100) * 240;
+                return (
+                  <div>
+                    <div style={{ height: 10, borderRadius: 5, background: `linear-gradient(90deg, var(--brand-2), var(--bad))`, marginBottom: 6 }} />
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
+                      <span style={{ color: `hsl(${hue}, 70%, 55%)`, fontWeight: 650 }}>{t}°C</span>
+                      <span className="muted">10–40°C</span>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+
+          {/* Accelerometer */}
+          <div className="card">
+            <h3 style={{ marginBottom: 12 }}>Accelerometer</h3>
+            <div className="grid cols-3" style={{ textAlign: "center" }}>
+              {["acc_x", "acc_y", "acc_z"].map(axis => (
+                <div key={axis}>
+                  <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>{axis}</div>
+                  <div style={{ fontSize: 16, fontWeight: 650 }}>{fmt(tele?.[axis], 1)}</div>
+                  <div className="muted" style={{ fontSize: 11 }}>mg</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+
+      {panel === "placeholder" && (
+        <div className="card" style={{ textAlign: "center", padding: 40 }}>
+          <h3 style={{ marginBottom: 8 }}>{profile.name} Dashboard</h3>
+          <p className="muted" style={{ margin: 0 }}>
+            {profile.name} support is coming soon. Live telemetry, LED matrix controls,
+            and button events will appear here once the {profile.name} transport is live.
+          </p>
+        </div>
+      )}
+
+      <ChatWidget deviceId={dev} />
+    </div>
+  );
+}
+
+// ---- Public flow (no auth): landing → catalog → deploy → live view ------
+function PublicFlow() {
+  const [step, setStep] = useState("detect");
+  const [deviceType, setDeviceType] = useState(null);
+  const [program, setProgram] = useState(null);
+  const [agent, setAgent] = useState(false);
+  const [deviceId, setDeviceIdRaw] = useState(() => {
+    try { return localStorage.getItem("fc_device_id") || DEFAULT_DEVICE_ID; } catch { return DEFAULT_DEVICE_ID; }
+  });
+  const [toastMsg, setToastMsg] = useState(null);
+  const toastTimer = useRef(0);
+
+  const setDeviceId = useCallback((v) => {
+    const id = (v || "").trim() || DEFAULT_DEVICE_ID;
+    setDeviceIdRaw(id);
+    try { localStorage.setItem("fc_device_id", id); } catch {}
+  }, []);
+
+  const toast = useCallback((m) => {
+    setToastMsg(m);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToastMsg(null), 3200);
+  }, []);
+
+  useEffect(() => { detectAgent().then(setAgent); }, []);
+
+  const showChrome = step !== "deploy";     // deploy takes over the full screen
+
+  return (
+    <div className="wrap">
+      {showChrome && (
+        <>
+          <div className="brandbar">
+            <div className="logo">F</div>
+            <div style={{ flex: 1 }}>
+              <h1>FunConnect</h1>
+              <div className="sub">Plug in · Pick a program · Go</div>
+            </div>
+            <a className="btn ghost sm" href="#login" style={{ textDecoration: "none" }}>Admin →</a>
+          </div>
+          <Stepper current={step} />
+        </>
+      )}
+
+      {step === "detect"    && <DeviceDetection agent={agent} onSelect={(id) => { setDeviceType(id); setStep("catalog"); }} />}
+      {step === "catalog"   && <Catalog deviceType={deviceType} selected={program} onSelect={setProgram} onDeploy={() => program && setStep("deploy")} onSkip={() => setStep("dashboard")} />}
+      {step === "deploy"    && <Deploy deviceType={deviceType} program={program} deviceId={deviceId} setDeviceId={setDeviceId} agent={agent}
+                                       onLive={() => setStep("dashboard")} onCancel={() => setStep("catalog")} toast={toast} />}
+      {step === "dashboard" && <Dashboard deviceType={deviceType} deviceId={deviceId} setDeviceId={setDeviceId} />}
+
+      {(step === "catalog" || step === "dashboard") && (
+        <div style={{ marginTop: 16 }}>
+          <button className="btn ghost sm" onClick={() => setStep(step === "dashboard" ? "catalog" : "detect")}>
+            {step === "dashboard" ? "← Back to Catalog" : "← Back"}
+          </button>
+        </div>
+      )}
+
+      {toastMsg && <div className="toast">{toastMsg}</div>}
+    </div>
+  );
+}
+
+// ---- Auth screens -------------------------------------------------------
+function Splash() {
+  return <div className="splash"><div className="logo lg">F</div><div className="spinner" /></div>;
+}
+
+function LoginPage({ onSuccess }) {
+  const [u, setU] = useState("");
+  const [p, setP] = useState("");
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true); setErr(null);
+    try {
+      const token = await apiLogin(u.trim(), p);
+      if (!token) { setErr("Server didn't return a token."); setBusy(false); return; }
+      try { localStorage.setItem(JWT_KEY, token); } catch {}
+      onSuccess(token);
+    } catch (e2) {
+      setErr(e2.status === 401 ? "Invalid username or password." : `Login failed${e2.status ? ` (${e2.status})` : ""}. Try again.`);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="auth-wrap">
+      <form className="auth-card" onSubmit={submit}>
+        <div className="brandbar" style={{ justifyContent: "center", marginBottom: 20 }}>
+          <div className="logo">F</div>
+          <div><h1>FunConnect</h1><div className="sub">Admin sign in</div></div>
+        </div>
+
+        <label className="lbl">Username</label>
+        <input type="text" value={u} autoFocus autoComplete="username" onChange={e => setU(e.target.value)} />
+
+        <label className="lbl" style={{ marginTop: 12 }}>Password</label>
+        <input type="password" value={p} autoComplete="current-password" onChange={e => setP(e.target.value)} />
+
+        {err && <p className="err" style={{ marginTop: 12 }}>{err}</p>}
+
+        <button className="btn lg" type="submit" disabled={busy || !u || !p} style={{ marginTop: 18 }}>
+          {busy ? <><span className="spinner" /> Signing in…</> : "Login"}
+        </button>
+
+      </form>
+    </div>
+  );
+}
+
+// ---- Connect Wizard (admin tab 1) -------------------------------------
+// Full guided connection flow: device cards → setup steps → mBlock popup →
+// upload guide → poll for online → success. All inline, no full-screen overlay.
+function ConnectWizard({ onDeviceReady, onBrowsePrograms }) {
+  const [sub, setSub] = useState(0);            // 0 pick device · 1 connect · 2 mBlock · 3 upload · 4 success
+  const [deviceType, setDeviceType] = useState(null);
+  const [deviceId, setDeviceIdState] = useState(DEFAULT_DEVICE_ID);
+  const [src, setSrc] = useState(null);
+  const [status, setStatus] = useState(null);
+  const [popupOpen, setPopupOpen] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const [transport, setTransportState] = useState(null); // "serial" | "wifi" | null
+  const [serialState, setSerialState] = useState("");     // "" | "connecting-serial" | "connecting-wss" | "connected-wss" | "polling" | "no-response" | "timeout" | "receiving-data"
+  const [serialErr, setSerialErr] = useState(null);
+  const [serialElapsed, setSerialElapsed] = useState(0);
+  const popupRef = useRef(null);
+  const doneRef = useRef(false);
+  const pollTimerRef = useRef(null);
+  const elapsedTimerRef = useRef(null);
+  const profile = deviceType ? DEVICE_PROFILES[deviceType] : null;
+
+  // Load hello-world as the default connection program.
+  useEffect(() => {
+    if (!deviceType || deviceType !== "cyberpi") return;
+    let alive = true;
+    getProgramSource("hello-world").then(t => alive && setSrc(t)).catch(() => {});
+    return () => { alive = false; };
+  }, [deviceType]);
+
+  // Poll for device online once upload has started (WiFi path only — serial
+  // path manages its own polling inside startSerialRelay with progressive timeout).
+  useEffect(() => {
+    if (sub < 12) return;             // Only poll at upload step or later.
+    if (transport === "serial") return; // Serial path handles its own polling.
+    let alive = true;
+    const poll = async () => {
+      try {
+        const s = await getDeviceStatus(deviceId);
+        if (!alive) return;
+        setStatus(s);
+        if (s.online && !doneRef.current) {
+          doneRef.current = true;
+          setConnected(true);
+          setSub(4);
+          try { if (popupRef.current && !popupRef.current.closed) popupRef.current.close(); } catch {}
+        }
+      } catch {}
+    };
+    poll();
+    const iv = setInterval(poll, 5000);
+    return () => { alive = false; clearInterval(iv); };
+  }, [sub, deviceId, transport]);
+
+  // Track popup closure.
+  useEffect(() => {
+    if (!popupOpen) return;
+    const iv = setInterval(() => {
+      if (popupRef.current && popupRef.current.closed) { setPopupOpen(false); clearInterval(iv); }
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [popupOpen]);
+
+  const selectDevice = (id) => {
+    setDeviceType(id);
+    setDeviceIdState(DEVICE_PROFILES[id].defaultDeviceId);
+    const p = DEVICE_PROFILES[id];
+    if (p.transports && p.transports.length > 1) {
+      // Multiple transports — show picker.
+      setSub(1);
+    } else if (p.transports && p.transports.length === 1 && p.transports[0].id === "serial") {
+      // Only serial transport — go direct.
+      const tCfg = p.transports[0];
+      if (tCfg.deviceId) setDeviceIdState(tCfg.deviceId);
+      startSerialRelay(tCfg.deviceId || p.defaultDeviceId);
+    } else {
+      // No transports — placeholder for unsupported devices.
+      setSub(99);
+    }
+  };
+
+  const selectTransport = (t) => {
+    setTransportState(t);
+    if (t === "serial") {
+      // Use relay-specific device ID from transport config.
+      const tCfg = profile.transports.find(x => x.id === "serial");
+      if (tCfg && tCfg.deviceId) setDeviceIdState(tCfg.deviceId);
+      startSerialRelay(tCfg ? tCfg.deviceId : deviceId);
+    } else {
+      // WiFi — use the WiFi transport's deviceId if present.
+      const tCfg = profile.transports.find(x => x.id === "wifi");
+      if (tCfg && tCfg.deviceId) setDeviceIdState(tCfg.deviceId);
+      setSub(10);
+    }
+  };
+
+  const startSerialRelay = async (relayDeviceId) => {
+    setSerialErr(null);
+    setSerialElapsed(0);
+    let port, ws;
+    try {
+      // Step 1 — request port FIRST (blocking dialog). Must happen before
+      // any state change so React flushes the UI after the user picks a port.
+      port = await navigator.serial.requestPort();
+
+      // VID/PID auto-detection — detect what's actually plugged in.
+      const info = port.getInfo();
+      const vidPid = (info.usbVendorId && info.usbProductId)
+        ? `0x${info.usbVendorId.toString(16).toUpperCase().padStart(4, "0")}:0x${info.usbProductId.toString(16).toUpperCase().padStart(4, "0")}`
+        : null;
+      const VID_MAP = {
+        "0x0D28:0x0204": "microbit",  // micro:bit V1
+        "0x0D28:0x0209": "microbit",  // micro:bit V2
+        "0x1A86:0x7523": "cyberpi",   // CyberPi (CH340)
+      };
+      const detectedType = vidPid ? VID_MAP[vidPid] : null;
+      if (detectedType && detectedType !== deviceType) {
+        // Gentle correction — auto-switch to detected device.
+        const detectedProfile = DEVICE_PROFILES[detectedType];
+        setDeviceType(detectedType);
+        setDeviceIdState(detectedProfile ? detectedProfile.defaultDeviceId : relayDeviceId);
+        relayDeviceId = detectedProfile ? detectedProfile.defaultDeviceId : relayDeviceId;
+      }
+
+      // Now show feedback — user has selected a port.
+      setSub(20); setSerialState("connecting-serial");
+
+      // Step 2 — open the port.
+      await port.open({ baudRate: 115200 });
+      setSerialState("connecting-wss");
+
+      // Step 3 — open WSS.
+      ws = new WebSocket(`${WS_BASE}/device/${encodeURIComponent(relayDeviceId)}`);
+      await new Promise((resolve, reject) => {
+        ws.onopen = resolve;
+        ws.onerror = () => reject(new Error("WSS connection failed — is the Worker deployed?"));
+      });
+      setSerialState("connected-wss");
+
+      // Step 4 — start relay and poll for device online with progressive timeout.
+      startRelay(port, ws, relayDeviceId);
+
+      // Listen for first-byte signal from relay.js — confirms hardware is alive
+      // even before the DO registers the device as online.
+      const bc = new BroadcastChannel("relay");
+      bc.onmessage = (event) => {
+        if (event.data.type === "first-byte" && event.data.deviceId === relayDeviceId) {
+          setSerialState("receiving-data");
+          bc.close();
+        }
+      };
+
+      // Phase 1 (0-15s): poll every 2s for device online.
+      const startTime = Date.now();
+      elapsedTimerRef.current = setInterval(() => {
+        setSerialElapsed(Math.round((Date.now() - startTime) / 1000));
+      }, 1000);
+      setSerialState("polling");
+
+      pollTimerRef.current = setInterval(async () => {
+        const elapsed = (Date.now() - startTime) / 1000;
+        try {
+          const s = await getDeviceStatus(relayDeviceId);
+          if (s && s.online) {
+            clearInterval(pollTimerRef.current);
+            clearInterval(elapsedTimerRef.current);
+            setConnected(true);
+            setSub(4);
+            return;
+          }
+        } catch {}
+        // Phase transitions based on elapsed time.
+        if (elapsed > 30) {
+          // Phase 3 (30s+): timeout.
+          clearInterval(pollTimerRef.current);
+          clearInterval(elapsedTimerRef.current);
+          setSerialState("timeout");
+        } else if (elapsed > 15) {
+          // Phase 2 (15-30s): no response.
+          setSerialState("no-response");
+        }
+      }, 2000);
+
+    } catch (e) {
+      console.error("Serial relay error:", e);
+      const msg = e.message || "Could not connect.";
+      setSerialErr(msg);
+      setSerialState("");
+      try { if (ws) ws.close(); } catch {}
+      try { if (port) port.close(); } catch {}
+      setSub(0);
+      alert("Connection failed: " + msg);
+    }
+  };
+
+  const openPopup = () => {
+    const p = openMblockPopup();
+    if (!p) return;
+    popupRef.current = p;
+    setPopupOpen(true);
+    setSub(12);
+    try { p.focus(); } catch {}
+  };
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(src || ""); }
+    catch {}
+  };
+  const download = () => {
+    const b = new Blob([src || ""], { type: "text/x-python" });
+    const u = URL.createObjectURL(b);
+    const a = document.createElement("a");
+    a.href = u; a.download = "hello-world.py"; a.click();
+    URL.revokeObjectURL(u);
+  };
+
+  // --- Success ---
+  if (sub === 4 && connected) {
+    return (
+      <div>
+        <Confetti />
+        <div className="card" style={{ textAlign: "center", padding: 32 }}>
+          <div className="ring-xl">✓</div>
+          <h2 style={{ fontSize: 22, margin: "10px 0 6px" }}>Device Connected</h2>
+          <p className="muted" style={{ fontSize: 15, marginBottom: 18 }}>
+            <b>{deviceId}</b> is online and streaming.
+          </p>
+          {onBrowsePrograms && deviceType === "microbit" && (
+            <button className="btn lg ghost" onClick={() => onBrowsePrograms(deviceType)} style={{ maxWidth: 300, marginBottom: 10 }}>
+              Browse Programs →
+            </button>
+          )}
+          <button className="btn lg" onClick={() => onDeviceReady(deviceType, deviceId)} style={{ maxWidth: 300 }}>
+            View Live Dashboard →
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // --- Step 0: Pick device ---
+  if (sub === 0) {
+    const profiles = Object.values(DEVICE_PROFILES);
+    return (
+      <div className="card">
+        <h2>Connect a Device</h2>
+        <p className="lead">Choose your device and we'll walk you through getting it online.</p>
+        <div className="grid cols-2">
+          {profiles.map(p => (
+            <button key={p.id}
+              onClick={() => selectDevice(p.id)}
+              style={{
+                display: "flex", flexDirection: "column", gap: 10, padding: 22,
+                background: "var(--panel-2)", border: "1px solid var(--line)", color: "var(--ink)",
+                borderRadius: 14, cursor: "pointer", textAlign: "left",
+                transition: "border-color .15s ease",
+              }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = "var(--brand)"; }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--line)"; }}
+            >
+              <h3 style={{ margin: 0, fontSize: 17, color: "var(--ink)" }}>{p.name}</h3>
+              <p className="muted" style={{ margin: 0, fontSize: 13.5, lineHeight: 1.5 }}>{p.description}</p>
+              <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                <span className="tag">{p.connection.method} · {p.connection.tool}</span>
+                <span style={{ color: "var(--brand)", fontSize: 14, fontWeight: 650 }}>Set Up →</span>
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // --- Step 1: Choose transport (devices with multiple transports) ---
+  if (sub === 1 && profile && profile.transports && profile.transports.length > 1) {
+    return (
+      <div className="card">
+        <div className="between" style={{ marginBottom: 18 }}>
+          <div>
+            <div className="eyebrow">Setting up {profile.name}</div>
+            <h2 style={{ margin: 0, fontSize: 20 }}>How is your {profile.name} connected?</h2>
+          </div>
+          <button className="btn ghost sm" onClick={() => { setSub(0); setTransportState(null); }}>← Back</button>
+        </div>
+        <div className="grid cols-2">
+          {profile.transports.map(t => (
+            <button key={t.id}
+              onClick={() => selectTransport(t.id)}
+              style={{
+                display: "flex", flexDirection: "column", gap: 10, padding: 22,
+                background: "var(--panel-2)", border: "1px solid var(--line)", color: "var(--ink)",
+                borderRadius: 14, cursor: "pointer", textAlign: "left",
+                transition: "border-color .15s ease",
+              }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = "var(--brand)"; }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--line)"; }}
+            >
+              <h3 style={{ margin: 0, fontSize: 17, color: "var(--ink)" }}>{t.label}</h3>
+              <p className="muted" style={{ margin: 0, fontSize: 13.5, lineHeight: 1.5 }}>{t.description}</p>
+              <span style={{ color: "var(--brand)", fontSize: 14, fontWeight: 650 }}>Select →</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // --- USB relay: connecting ---
+  if (sub === 20) {
+    const backFromRelay = () => {
+      clearInterval(pollTimerRef.current);
+      clearInterval(elapsedTimerRef.current);
+      disconnectRelay();
+      setSub(1);
+      setTransportState(null);
+    };
+    const tryAgain = () => {
+      clearInterval(pollTimerRef.current);
+      clearInterval(elapsedTimerRef.current);
+      setSerialErr(null);
+      const tCfg = profile?.transports?.find(x => x.id === "serial");
+      startSerialRelay(tCfg?.deviceId || deviceId);
+    };
+    const isMicrobit = deviceType === "microbit";
+    return (
+      <div className="card" style={{ textAlign: "center", padding: 32 }}>
+        <div className="between" style={{ marginBottom: 18 }}>
+          <div>
+            <div className="eyebrow">Setting up {profile?.name} · USB</div>
+            <h2 style={{ margin: 0, fontSize: 20 }}>USB Relay</h2>
+          </div>
+          <button className="btn ghost sm" onClick={backFromRelay}>← Back</button>
+        </div>
+
+        {serialState === "connecting-serial" && (
+          <div>
+            <div className="pulsebar"><span className="pulsedot" /> Opening serial port…</div>
+            <p className="muted">Select your {profile?.name} in the browser dialog. It should appear as a COM port or serial device.</p>
+          </div>
+        )}
+
+        {serialState === "connecting-wss" && (
+          <div>
+            <div style={{ fontSize: 40, marginBottom: 12 }}>✓</div>
+            <div className="pulsebar"><span className="pulsedot" /> Connecting to FunConnect…</div>
+            <p className="muted">Serial port opened. Establishing secure WebSocket to the relay server.</p>
+          </div>
+        )}
+
+        {(serialState === "connected-wss" || serialState === "polling") && (
+          <div>
+            <div style={{ fontSize: 48, marginBottom: 8, color: "var(--brand)" }}>✓</div>
+            <div className="pulsebar" style={{ borderColor: "rgba(55,224,166,.35)", background: "rgba(55,224,166,.07)" }}>
+              <span className="pulsedot" style={{ background: "var(--brand)", boxShadow: "0 0 12px var(--brand)" }} />
+              Relay active — waiting for hello from {deviceId}…
+              {serialElapsed > 0 && <span style={{ marginLeft: 8, fontSize: 12, opacity: .7 }}>({serialElapsed}s)</span>}
+            </div>
+            <p className="muted" style={{ fontSize: 14 }}>
+              <b>{deviceId}</b> is connected via USB. Waiting for telemetry…
+            </p>
+          </div>
+        )}
+
+        {serialState === "receiving-data" && (
+          <div>
+            <div style={{ fontSize: 48, marginBottom: 8, color: "var(--brand)" }}>✓</div>
+            <div className="pulsebar" style={{ borderColor: "rgba(55,224,166,.35)", background: "rgba(55,224,166,.07)" }}>
+              <span className="pulsedot" style={{ background: "var(--brand)", boxShadow: "0 0 12px var(--brand)" }} />
+              Receiving data from {deviceId}…
+            </div>
+            <p className="muted" style={{ fontSize: 14 }}>
+              Hardware is alive — waiting for the server to register the device.
+            </p>
+          </div>
+        )}
+
+        {serialState === "no-response" && (
+          <div>
+            <div style={{ fontSize: 48, marginBottom: 8, color: "var(--warn)" }}>?</div>
+            <div className="pulsebar" style={{ borderColor: "rgba(255,180,84,.35)", background: "rgba(255,180,84,.07)" }}>
+              <span className="pulsedot" style={{ background: "var(--warn)", boxShadow: "0 0 12px var(--warn)" }} />
+              No response — is the firmware flashed?
+            </div>
+            <p className="muted" style={{ fontSize: 14, marginBottom: 16 }}>
+              The relay is connected but no data has arrived from {deviceId} after {serialElapsed}s.
+            </p>
+            <button className="btn" onClick={() => saveHexToMicrobit()}>
+              ↓ Download Firmware
+            </button>
+          </div>
+        )}
+
+        {serialState === "timeout" && (
+          <div>
+            <div style={{ fontSize: 48, marginBottom: 8, color: "var(--bad)" }}>✕</div>
+            <div className="pulsebar" style={{ borderColor: "rgba(255,107,107,.35)", background: "rgba(255,107,107,.07)" }}>
+              <span className="pulsedot" style={{ background: "var(--bad)", boxShadow: "0 0 12px var(--bad)" }} />
+              Device not responding.
+            </div>
+            <p className="muted" style={{ fontSize: 14, marginBottom: 16 }}>
+              No response from {deviceId} after 30 seconds.
+            </p>
+            <div className="row" style={{ gap: 10, justifyContent: "center" }}>
+              <button className="btn" onClick={() => saveHexToMicrobit()}>↓ Download Firmware</button>
+              <button className="btn ghost" onClick={tryAgain}>Try Again</button>
+            </div>
+          </div>
+        )}
+
+        {serialErr && (
+          <div style={{
+            background: "rgba(255,107,107,.12)", border: "1px solid var(--bad)",
+            borderRadius: 14, padding: 24, marginTop: 18, textAlign: "left",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+              <span style={{ fontSize: 20 }}>!</span>
+              <span style={{ color: "var(--bad)", fontWeight: 700, fontSize: 16 }}>Connection Failed</span>
+            </div>
+            <p style={{ color: "var(--ink)", margin: "0 0 16px", fontSize: 14, lineHeight: 1.5 }}>
+              {serialErr}
+            </p>
+
+            <div style={{ color: "var(--muted)", fontSize: 13, marginBottom: 6, fontWeight: 650 }}>
+              Possible reasons:
+            </div>
+            <ul style={{ color: "var(--muted)", fontSize: 13, margin: "0 0 18px", paddingLeft: 18, lineHeight: 1.7 }}>
+              {(() => {
+                const msg = (serialErr || "").toLowerCase();
+                if (isMicrobit) {
+                  return [
+                    "The micro:bit may not have the relay firmware flashed — download it below",
+                    "Unplug and replug the micro:bit — wait 5 seconds",
+                    "Try Chrome or Edge if Opera is having trouble",
+                    "The device was unplugged — check the USB cable and wait 5 seconds",
+                  ].map((b, i) => <li key={i}>{b}</li>);
+                }
+                // CyberPi messages.
+                const bullets = [];
+                if (msg.includes("port") || msg.includes("serial") || msg.includes("busy")) {
+                  bullets.push("mBlock is still open — close it and try again");
+                  bullets.push("mLink2 is running — quit from the system tray");
+                }
+                if (msg.includes("wss") || msg.includes("websocket") || msg.includes("worker"))
+                  bullets.push("The FunConnect Worker may be hibernating — wait 5s and try again");
+                if (msg.includes("wss") || msg.includes("websocket"))
+                  bullets.push("The device ID doesn't match the firmware — check relay.py DEVICE_ID");
+                bullets.push("The device was unplugged — check the USB cable and wait 5 seconds");
+                bullets.push("relay.py may not be flashed — upload it via mBlock first");
+                return bullets.map((b, i) => <li key={i}>{b}</li>);
+              })()}
+            </ul>
+
+            <div className="row" style={{ gap: 10 }}>
+              <button className="btn" onClick={tryAgain}>Try Again</button>
+              {isMicrobit ? (
+                <button className="btn ghost" onClick={() => saveHexToMicrobit()}>Download Firmware →</button>
+              ) : (
+                <button className="btn ghost" onClick={() => {
+                  setSerialErr(null); setTransportState("wifi");
+                  const tCfg = profile?.transports?.find(x => x.id === "wifi");
+                  if (tCfg?.deviceId) setDeviceIdState(tCfg.deviceId);
+                  setSub(10);
+                }}>Use WiFi Instead</button>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // --- Steps 10-12: WiFi / mBlock path (CyberPi) ---
+  if (profile && profile.id === "cyberpi" && (sub >= 10 && sub <= 12)) {
+    const wifiStep = sub - 9; // 1, 2, 3
+    return (
+      <div className="card">
+        <div className="between" style={{ marginBottom: 18 }}>
+          <div>
+            <div className="eyebrow">Setting up {profile.name} · WiFi</div>
+            <h2 style={{ margin: 0, fontSize: 20 }}>Get Your Device Online</h2>
+          </div>
+          <button className="btn ghost sm" onClick={() => { setSub(1); setTransportState(null); }}>← Back</button>
+        </div>
+
+        <div className="progress-dots" style={{ marginBottom: 22 }}>
+          {["Connect","Open mBlock","Upload"].map((lb, i) => (
+            <span key={lb} className={"dot-lg " + (i + 1 === wifiStep ? "active" : i + 1 < wifiStep ? "done" : "")}>
+              {i + 1 < wifiStep ? "✓" : i + 1}
+            </span>
+          ))}
+          <span className="stepcount">Step {Math.min(wifiStep, 3)} of 3</span>
+        </div>
+
+        {sub === 10 && (
+          <div className="substep">
+            <div className="illus"><BoardIllustration /></div>
+            <h3>Connect Your {profile.name}</h3>
+            <p>
+              Plug your {profile.name} into this computer with the USB cable and switch it on.
+              Make sure <b>mLink2</b> is installed so mBlock can see it.{" "}
+              <a href={MLINK_DOWNLOAD} target="_blank" rel="noreferrer">Get mLink2 ↗</a>
+            </p>
+            <div style={{ marginBottom: 18 }}>
+              <label className="lbl">Device name — this is how your dashboard finds the board</label>
+              <input type="text" value={deviceId} onChange={e => setDeviceIdState(e.target.value)}
+                style={{ color: "var(--ink)", background: "var(--panel-2)" }} />
+              <p className="muted" style={{ fontSize: 13, marginTop: 6 }}>Default is <b>{profile.defaultDeviceId}</b>. Leave it unless you renamed the device.</p>
+            </div>
+            <div className="between">
+              <button className="btn ghost" onClick={() => { setSub(1); setTransportState(null); }}>← Back</button>
+              <button className="btn lg" style={{ width: "auto" }} onClick={() => setSub(11)}>
+                My {profile.name} Is Plugged In →
+              </button>
+            </div>
+          </div>
+        )}
+
+        {sub === 11 && (
+          <div className="substep">
+            <h3>Open mBlock</h3>
+            <p>
+              We'll open the mBlock editor in a focused window. You'll upload a program there,
+              then come straight back — this page keeps waiting for your device.
+            </p>
+            <button className="btn lg" onClick={openPopup}>Open mBlock →</button>
+            <button className="btn ghost block" style={{ marginTop: 10 }} onClick={() => setSub(10)}>← Back</button>
+          </div>
+        )}
+
+        {sub === 12 && (
+          <div className="substep">
+            <div className="pulsebar"><span className="pulsedot" /> Upload in Progress — finish in the mBlock window</div>
+            <h3>Upload Your Program</h3>
+            <p style={{ marginBottom: 14 }}>In the mBlock window, do these three things:</p>
+            <div className="mini">
+              <div className="m"><span className="mn">1</span><div>Switch mBlock to <b>Python</b> mode (top-right toggle).</div></div>
+              <div className="m"><span className="mn">2</span>
+                <div>Clear the editor and <b>paste the connection program</b>.
+                  <div className="row" style={{ marginTop: 8 }}>
+                    <button className="btn sm" onClick={copy} disabled={!src}>Copy Code</button>
+                    <button className="btn sm ghost" onClick={download} disabled={!src}>Download .py</button>
+                  </div>
+                </div>
+              </div>
+              <div className="m"><span className="mn">3</span><div>Click <b>Upload</b> (not Run). Your board reboots and connects.</div></div>
+            </div>
+
+            <div className="waiting"><span className="spinner" /> Waiting for <b>&nbsp;{deviceId}&nbsp;</b> to come online
+              {status && <span className="muted"> · {status.telemetry_count ?? 0} packets</span>}
+            </div>
+
+            {!popupOpen && (
+              <button className="btn ghost block" style={{ marginTop: 14 }} onClick={openPopup}>Reopen mBlock Window</button>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // --- other / unsupported — placeholder ---
+  return (
+    <div className="card" style={{ textAlign: "center", padding: 40 }}>
+      <h3 style={{ marginBottom: 8 }}>{profile ? profile.name : "Device"} Setup</h3>
+      <p className="muted" style={{ margin: 0 }}>
+        {profile ? profile.name : "This device"} support is coming soon.
+      </p>
+      <button className="btn ghost sm" style={{ marginTop: 14 }} onClick={() => setSub(0)}>← Back</button>
+    </div>
+  );
+}
+
+// Admin = branded shell with left sidebar nav. Connect + Devices are primary;
+// Deploy and Live are secondary. Live is admin-only (always visible here since
+// this entire shell is behind auth).
+function AdminShell({ me, token, onLogout }) {
+  const [tab, setTab] = useState("connect");
+  const [deviceType, setDeviceType] = useState("cyberpi");
+  const [deviceId, setDeviceIdRaw] = useState(() => {
+    try { return localStorage.getItem("fc_device_id") || DEFAULT_DEVICE_ID; } catch { return DEFAULT_DEVICE_ID; }
+  });
+  const [toastMsg, setToastMsg] = useState(null);
+  const toastTimer = useRef(0);
+
+  const setDeviceId = useCallback((v) => {
+    const id = (v || "").trim() || DEFAULT_DEVICE_ID;
+    setDeviceIdRaw(id);
+    try { localStorage.setItem("fc_device_id", id); } catch {}
+  }, []);
+  const toast = useCallback((m) => {
+    setToastMsg(m);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToastMsg(null), 3200);
+  }, []);
+
+  const SIDEBAR_W = 180;
+  const tabs = [
+    { key: "connect", label: "Connect" },
+    { key: "devices", label: "Devices" },
+    { key: "deploy",  label: "Deploy" },
+  ];
+
+  return (
+    <div style={{ display: "flex", minHeight: "100vh" }}>
+      {/* ---- sidebar ---- */}
+      <div style={{
+        width: SIDEBAR_W, flexShrink: 0, background: "var(--panel)",
+        borderRight: "1px solid var(--line)", display: "flex", flexDirection: "column",
+        padding: "20px 0",
+      }}>
+        <div style={{ padding: "0 16px 16px", borderBottom: "1px solid var(--line)", marginBottom: 8 }}>
+          <div className="brandbar" style={{ marginBottom: 0 }}>
+            <div className="logo" style={{ width: 28, height: 28, fontSize: 13, borderRadius: 7 }}>F</div>
+            <h1 style={{ fontSize: 15 }}>FunConnect</h1>
+          </div>
+        </div>
+
+        <nav style={{ flex: 1, display: "flex", flexDirection: "column", padding: "8px 10px" }}>
+          {tabs.map(t => {
+            if (t.admin && !me) return null;
+            const active = tab === t.key;
+            return (
+              <button key={t.key}
+                onClick={() => setTab(t.key)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 8, width: "100%",
+                  padding: "9px 12px", marginBottom: 2, border: 0, borderRadius: 8,
+                  background: active ? "var(--brand)" : "transparent",
+                  color: active ? "#fff" : "var(--ink)",
+                  cursor: "pointer", fontSize: 13.5, fontWeight: active ? 700 : 500,
+                  textAlign: "left", transition: "background .12s ease, color .12s ease",
+                }}
+                onMouseEnter={e => { if (!active) e.currentTarget.style.background = "var(--panel-2)"; }}
+                onMouseLeave={e => { if (!active) e.currentTarget.style.background = "transparent"; }}
+              >
+                {t.label}
+                {t.admin && <span style={{ fontSize: 10, opacity: .5, marginLeft: "auto" }}>admin</span>}
+              </button>
+            );
+          })}
+        </nav>
+
+        <div style={{ padding: "8px 16px", borderTop: "1px solid var(--line)" }}>
+          <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
+            {me?.username || "admin"}
+          </div>
+          <button className="btn ghost sm" onClick={onLogout} style={{ width: "100%" }}>Log out</button>
+        </div>
+      </div>
+
+      {/* ---- content ---- */}
+      <div style={{ flex: 1, padding: 20, overflow: "auto" }}>
+        {tab === "connect" && (
+          <ConnectWizard onDeviceReady={(type, id) => { setDeviceType(type); setDeviceId(id); setTab("devices"); }} onBrowsePrograms={(type) => { setDeviceType(type); setTab("deploy"); }} />
+        )}
+        {tab === "devices" && (
+          <AdminDevices token={token} onLogout={onLogout} deviceType={deviceType} />
+        )}
+        {tab === "deploy" && (
+          <AdminDeploy deviceId={deviceId} setDeviceId={setDeviceId} toast={toast} deviceType={deviceType} onDone={() => setTab("devices")} />
+        )}
+        {toastMsg && <div className="toast">{toastMsg}</div>}
+      </div>
+    </div>
+  );
+}
+
+// Admin › Dashboard tab — tenant device list (collapsed by base id) + live telemetry.
+function AdminDevices({ token, onLogout, deviceType = "cyberpi" }) {
+  const [devices, setDevices] = useState(null);
+  const [err, setErr] = useState(null);
+  const [sel, setSel] = useState(null);
+  const selRef = useRef(null);
+  useEffect(() => { selRef.current = sel; }, [sel]);
+
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const d = await apiAdminDevices(token);
+        if (!alive) return;
+        setDevices(d); setErr(null);
+        if (!selRef.current) {
+          const gs = groupDevices(d);
+          let target = gs.find(g => g.online)?.target;
+          if (!target) {                    // flags lag rotation — probe a few group targets
+            for (const g of gs.slice(0, 6)) {
+              try { const s = await getDeviceStatus(g.target); if (alive && s && s.online) { target = g.target; break; } } catch {}
+            }
+          }
+          if (alive) setSel(target || gs[0]?.target || null);
+        }
+      } catch (e) {
+        if (!alive) return;
+        if (e.status === 401) { onLogout(); return; }
+        setErr("Couldn't load devices — the admin endpoint may not be deployed yet.");
+        setDevices([]);
+      }
+    };
+    load();
+    const iv = setInterval(load, 15000);
+    return () => { alive = false; clearInterval(iv); };
+  }, [token, onLogout]);
+
+  const groups = devices ? groupDevices(devices) : null;
+  const selGroup = sel && groups ? groups.find(g => g.target === sel) : null;
+  // Trust the deviceType prop from AdminShell (set by ConnectWizard flow).
+  // API-derived device_type is a fallback, never an override.
+  const selType = deviceType !== "cyberpi" ? deviceType : (selGroup?.deviceType || "cyberpi");
+
+  return (
+    <div className="admin-grid">
+      <div className="card">
+        <div className="between" style={{ marginBottom: 12 }}>
+          <h3 style={{ margin: 0 }}>Devices</h3>
+          {groups && <span className="muted" style={{ fontSize: 12 }}>{groups.length} device{groups.length === 1 ? "" : "s"}</span>}
+        </div>
+        {!devices && !err && <p className="muted"><span className="spinner" /> Loading…</p>}
+        {err && <p className="err" style={{ fontSize: 13 }}>{err}</p>}
+        {groups && groups.length === 0 && !err && <p className="muted">No devices in your tenant yet.</p>}
+        {groups && groups.map(g => (
+          <button key={g.base} className={"alert-row " + (sel === g.target ? "sel" : "")}
+                  onClick={() => setSel(g.target)} style={{ marginBottom: 6 }}>
+            <span className="ar-dot" style={{ background: g.online ? "var(--brand)" : "var(--muted)" }} />
+            <span className="ar-cls" style={{ textTransform: "none" }}>{g.base}</span>
+            <span className="ar-meta">{g.telem.toLocaleString()} pkts</span>
+            <span className="ar-time">{g.online ? "online" : `${g.count} id${g.count === 1 ? "" : "s"}`}</span>
+          </button>
+        ))}
+      </div>
+
+      <div>
+        {sel
+          ? <Dashboard deviceId={sel} setDeviceId={setSel} follow={false} showDeviceControls={false} deviceType={selType} />
+          : <div className="card"><p className="muted" style={{ margin: 0 }}>Select a device to view live telemetry.</p></div>}
+      </div>
+    </div>
+  );
+}
+
+// Admin › Deploy tab — the FULL step-by-step guide (intro/mLink2 → choose program →
+// connect CyberPi → mBlock popup → upload), ending back on the admin dashboard.
+function AdminDeploy({ deviceId, setDeviceId, toast, onDone, deviceType = "cyberpi" }) {
+  const [sub, setSub] = useState("detect");
+  const [program, setProgram] = useState(null);
+  const [agent, setAgent] = useState(false);
+  useEffect(() => { detectAgent().then(setAgent); }, []);
+
+  if (sub === "deploy" && program) {
+    return <Deploy deviceType="cyberpi" program={program} deviceId={deviceId} setDeviceId={setDeviceId} agent={agent}
+                   onLive={onDone} onCancel={() => setSub("catalog")} toast={toast} />;
+  }
+  return (
+    <>
+      <Stepper current={sub} />
+      {sub === "detect" && <Landing agent={agent} onStart={() => setSub("catalog")} onViewDashboard={onDone} />}
+      {sub === "catalog" && <Catalog deviceType={deviceType} selected={program} onSelect={setProgram}
+                                     onDeploy={() => program && setSub("deploy")} onSkip={onDone} />}
+      {sub === "catalog" && (
+        <div style={{ marginTop: 16 }}>
+          <button className="btn ghost sm" onClick={() => setSub("detect")}>← Back</button>
+        </div>
+      )}
+    </>
+  );
+}
+
+// ---- Root: hash routing + auth gate -------------------------------------
+function parseHash() {
+  let h = "";
+  try { h = (location.hash || "").replace(/^#\/?/, "").toLowerCase(); } catch {}
+  if (h.startsWith("catalog") || h.startsWith("deploy")) return "catalog";
+  if (h.startsWith("dashboard")) return "dashboard";
+  if (h.startsWith("login")) return "login";
+  return "root";
+}
+
+function App() {
+  const [route, setRoute] = useState(parseHash);
+  const [token, setToken] = useState(() => getJwt());
+  const [auth, setAuth] = useState(() => (getJwt() ? "checking" : "anon"));
+  const [me, setMe] = useState(null);
+
+  // Follow hash changes.
+  useEffect(() => {
+    const onHash = () => setRoute(parseHash());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  // Validate the stored JWT whenever it changes.
+  useEffect(() => {
+    let alive = true;
+    if (!token) { setAuth("anon"); setMe(null); return; }
+    setAuth("checking");
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000));
+    Promise.race([apiMe(token), timeout]).then(u => {
+      if (!alive) return;
+      if (u) { setMe(u); setAuth("authed"); }
+      else { setMe(null); setAuth("anon"); try { localStorage.removeItem(JWT_KEY); } catch {} }
+    }).catch(() => {
+      if (!alive) return;
+      setMe(null); setAuth("anon");
+      try { localStorage.removeItem(JWT_KEY); } catch {}
+    });
+    return () => { alive = false; };
+  }, [token]);
+
+  // Redirects (side-effect, never during render). Public route is never gated.
+  useEffect(() => {
+    if (route === "catalog" || auth === "checking") return;
+    if (route === "root") location.hash = auth === "authed" ? "#dashboard" : "#login";
+    else if (route === "login" && auth === "authed") location.hash = "#dashboard";
+    else if (route === "dashboard" && auth === "anon") location.hash = "#login";
+  }, [route, auth]);
+
+  const onLogin = useCallback((tok) => { setToken(tok); location.hash = "#dashboard"; }, []);
+  const onLogout = useCallback(() => {
+    try { localStorage.removeItem(JWT_KEY); } catch {}
+    setToken(null); setMe(null); setAuth("anon"); location.hash = "#login";
+  }, []);
+
+  if (route === "catalog") return <PublicFlow />;
+  if (auth === "checking") return <Splash />;
+  if (route === "login") return auth === "authed" ? <Splash /> : <LoginPage onSuccess={onLogin} />;
+  if (route === "dashboard") return auth === "authed" ? <AdminShell me={me} token={token} onLogout={onLogout} /> : <Splash />;
+  return <Splash />;   // root — redirect effect sends us on
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);

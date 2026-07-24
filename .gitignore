@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/
+*.bin
+cyberpi-storage-*.bin
+__pycache__/
+*.pyc
+.DS_Store
+*.bin
