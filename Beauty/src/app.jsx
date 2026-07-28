@@ -24,6 +24,14 @@ const DEVICE_PROFILES = {
     catalogTag: "cyberpi",
     telemetry: { dashboardPanel: "imu" },
     deploy: { programFormat: ".py" },
+    catalog: {
+      tag: "cyberpi",
+      actions: [
+        { id: "flash-serial", label: "⚡ Flash with FunConnect →", requires: "serial", primary: true },
+        { id: "mblock", label: "Open in mBlock →", fallback: true },
+        { id: "skip", label: "Skip to Dashboard →", ghost: true },
+      ],
+    },
     transports: [
       { id: "usb", label: "USB (Quick Flash)", description: "One-click flash via Web Serial. No editor, no WiFi. Pair once, instant after.", deviceId: "cyberpi", status: "active" },
       { id: "wifi", label: "WiFi (mBlock)", description: "Step-by-step guided wizard — connect, open mBlock, upload, go live. Requires WiFi + mLink2.", deviceId: "cyberpi", status: "active" },
@@ -41,6 +49,15 @@ const DEVICE_PROFILES = {
     catalogTag: "microbit",
     telemetry: { dashboardPanel: "microbit" },
     deploy: { programFormat: ".hex" },
+    catalog: {
+      tag: "microbit",
+      actions: [
+        { id: "flash-hid", label: "⚡ Flash with FunConnect →", requires: "hid", primary: true },
+        { id: "save-msd", label: "Save to micro:bit →", ghost: true },
+        { id: "makecode", label: "Open in MakeCode →", ghost: true },
+        { id: "download", label: "↓ Download .hex", ghost: true, sm: true },
+      ],
+    },
     transports: [
       { id: "webhid", label: "USB (WebHID Flash)", description: "Zero-click browser flash — one pairing, then instant. ~16s.", deviceId: "microbit-01", status: "active" },
       { id: "msd", label: "Save to Drive (MSD)", description: "Save .hex to MICROBIT drive — works on all browsers.", deviceId: "microbit-01", status: "active" },
@@ -268,18 +285,7 @@ function WebhidFlashOverlay({ program, onClose, onDone, onDashboard }) {
 
         {phase === "pair" && (
           <div style={{ textAlign: "center" }}>
-            <svg width="200" height="120" viewBox="0 0 200 120" style={{ margin: "0 auto 18px", display: "block" }}>
-              <rect x="45" y="8" width="110" height="72" rx="10" fill="var(--panel-2)" stroke="var(--line)" strokeWidth="2"/>
-              <rect x="55" y="18" width="50" height="32" rx="4" fill="var(--panel)" stroke="var(--line)" strokeWidth="1.5"/>
-              <circle cx="72" cy="28" r="3" fill="var(--brand)"/>
-              <circle cx="82" cy="28" r="3" fill="var(--brand)"/>
-              <circle cx="92" cy="28" r="3" fill="var(--brand)"/>
-              <circle cx="72" cy="38" r="3" fill="var(--brand)"/>
-              <circle cx="82" cy="38" r="3" fill="var(--accent)"/>
-              <circle cx="92" cy="38" r="3" fill="var(--brand)"/>
-              <rect x="55" y="55" width="90" height="16" rx="3" fill="var(--panel-2)" stroke="var(--line)" strokeWidth="1"/>
-              <text x="100" y="108" textAnchor="middle" fill="var(--muted)" fontSize="11" fontFamily="system-ui">micro:bit</text>
-            </svg>
+            <MicrobitIllustration />
             <p style={{ fontSize: 15, lineHeight: 1.5, margin: "0 0 18px", color: "var(--muted)" }}>
               Click below to pair your micro:bit. This only happens once — after that, flashing is one click.
             </p>
@@ -330,7 +336,7 @@ function WebhidFlashOverlay({ program, onClose, onDone, onDashboard }) {
 
         {phase === "error" && (
           <div style={{ textAlign: "center" }}>
-            <p className="err" style={{ fontSize: 15, marginBottom: 18 }}>
+            <p className="err" role="alert" style={{ fontSize: 15, marginBottom: 18 }}>
               {errMsg}
             </p>
             <div className="row" style={{ gap: 10, justifyContent: "center" }}>
@@ -582,6 +588,24 @@ function BoardIllustration() {
     </svg>
   );
 }
+function MicrobitIllustration() {
+  return (
+    <svg width="200" height="120" viewBox="0 0 200 120" style={{margin:"0 auto 18px",display:"block"}}>
+      <rect x="45" y="8" width="110" height="72" rx="10" fill="var(--panel-2)" stroke="var(--line)" strokeWidth="2"/>
+      <rect x="55" y="18" width="50" height="32" rx="4" fill="var(--panel)" stroke="var(--line)" strokeWidth="1.5"/>
+      {[[72,28],[82,28],[92,28],[72,38],[82,38],[92,38]].map(([cx,cy],i) => (
+        <circle key={i} cx={cx} cy={cy} r="3" fill={i===4 ? "var(--accent)" : "var(--brand)"}/>
+      ))}
+      <rect x="112" y="18" width="30" height="32" rx="4" fill="var(--panel)" stroke="var(--line)" strokeWidth="1.5"/>
+      <circle cx="127" cy="34" r="8" fill="none" stroke="var(--brand)" strokeWidth="2"/>
+      <rect x="55" y="55" width="90" height="16" rx="3" fill="var(--panel-2)" stroke="var(--line)" strokeWidth="1"/>
+      <line x1="25" y1="48" x2="45" y2="44" stroke="var(--brand)" strokeWidth="3" strokeLinecap="round"/>
+      <line x1="25" y1="54" x2="45" y2="56" stroke="var(--accent)" strokeWidth="3" strokeLinecap="round"/>
+      <text x="100" y="108" textAnchor="middle" fill="var(--muted)" fontSize="11" fontFamily="system-ui">micro:bit</text>
+    </svg>
+  );
+}
+
 
 // ---- Step 0: Device Detection -------------------------------------------
 // Replaces the old Landing screen. Two modes:
@@ -748,7 +772,7 @@ function CyberPiFlashOverlay({ program, onClose, onDone, onDashboard }) {
           <div style={{ textAlign: "center" }}>
             <div className="illus"><BoardIllustration /></div>
             <p style={{ fontSize: 15, lineHeight: 1.5, margin: "0 0 18px", color: "var(--muted)" }}>
-              Click below to pair your CyberPi via USB. This only happens once — after that, flashing is one click.
+              Click below to pair your CyberPi via USB. This happens once per USB port — plug into the same port next time and flashing is one click.
             </p>
             <button className="btn lg" onClick={handlePair}>Pair Device →</button>
             <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>
@@ -787,7 +811,7 @@ function CyberPiFlashOverlay({ program, onClose, onDone, onDashboard }) {
 
         {phase === "error" && (
           <div style={{ textAlign: "center" }}>
-            <p className="err" style={{ fontSize: 15, marginBottom: 18 }}>
+            <p className="err" role="alert" style={{ fontSize: 15, marginBottom: 18 }}>
               {errMsg}
             </p>
             <div className="row" style={{ gap: 10, justifyContent: "center" }}>
@@ -834,22 +858,7 @@ function MicrobitSaveOverlay({ program, onClose, onDone, onDashboard }) {
 
         {phase === "guide" && (
           <div style={{ textAlign: "center" }}>
-            <svg width="200" height="120" viewBox="0 0 200 120" style={{ margin: "0 auto 18px", display: "block" }}>
-              <rect x="45" y="8" width="110" height="72" rx="10" fill="var(--panel-2)" stroke="var(--line)" strokeWidth="2"/>
-              <rect x="55" y="18" width="50" height="32" rx="4" fill="var(--panel)" stroke="var(--line)" strokeWidth="1.5"/>
-              <circle cx="72" cy="28" r="3" fill="var(--brand)"/>
-              <circle cx="82" cy="28" r="3" fill="var(--brand)"/>
-              <circle cx="92" cy="28" r="3" fill="var(--brand)"/>
-              <circle cx="72" cy="38" r="3" fill="var(--brand)"/>
-              <circle cx="82" cy="38" r="3" fill="var(--accent)"/>
-              <circle cx="92" cy="38" r="3" fill="var(--brand)"/>
-              <rect x="112" y="18" width="30" height="32" rx="4" fill="var(--panel)" stroke="var(--line)" strokeWidth="1.5"/>
-              <circle cx="127" cy="34" r="8" fill="none" stroke="var(--brand)" strokeWidth="2"/>
-              <rect x="55" y="55" width="90" height="16" rx="3" fill="var(--panel-2)" stroke="var(--line)" strokeWidth="1"/>
-              <line x1="25" y1="48" x2="45" y2="44" stroke="var(--brand)" strokeWidth="3" strokeLinecap="round"/>
-              <line x1="25" y1="54" x2="45" y2="56" stroke="var(--accent)" strokeWidth="3" strokeLinecap="round"/>
-              <text x="100" y="108" textAnchor="middle" fill="var(--muted)" fontSize="11" fontFamily="system-ui">micro:bit</text>
-            </svg>
+            <MicrobitIllustration />
             <p style={{ fontSize: 15, lineHeight: 1.5, margin: "0 0 18px", color: "var(--muted)" }}>
               Your program is ready. Click below, then choose your <b>MICROBIT</b> drive.
             </p>
@@ -895,7 +904,7 @@ function MicrobitSaveOverlay({ program, onClose, onDone, onDashboard }) {
 
         {phase === "error" && (
           <div style={{ textAlign: "center" }}>
-            <p className="err" style={{ fontSize: 15, marginBottom: 18 }}>
+            <p className="err" role="alert" style={{ fontSize: 15, marginBottom: 18 }}>
               Couldn't save: {errMsg}
             </p>
             <div className="row" style={{ gap: 10, justifyContent: "center" }}>
@@ -913,6 +922,45 @@ function MicrobitSaveOverlay({ program, onClose, onDone, onDashboard }) {
 }
 
 // ---- Step 2: Catalog ----------------------------------------------------
+
+function capabilityCheck(req) {
+  if (req === "hid") return typeof navigator !== "undefined" && !!navigator.hid;
+  if (req === "serial") return typeof navigator !== "undefined" && !!navigator.serial;
+  if (req === "filesystem") return typeof window !== "undefined" && "showSaveFilePicker" in window;
+  return true;
+}
+
+function handleCatalogAction(actionId, program, handlers) {
+  switch (actionId) {
+    case "flash-hid":
+    case "flash-serial":
+      if (handlers.setFlashOverlay) handlers.setFlashOverlay(program);
+      break;
+    case "save-msd":
+      if (handlers.setOverlay) handlers.setOverlay(program);
+      break;
+    case "makecode":
+      (async () => {
+        try {
+          const resp = await fetch(API_BASE + "/api/catalog/" + encodeURIComponent(program.id));
+          const src = await resp.text();
+          await navigator.clipboard.writeText(src);
+        } catch {}
+        openMakeCodePopup();
+      })();
+      break;
+    case "mblock":
+      if (handlers.onDeploy) handlers.onDeploy();
+      break;
+    case "download":
+      downloadHex(program.id, program.name);
+      break;
+    case "skip":
+      if (handlers.onSkip) handlers.onSkip();
+      break;
+  }
+}
+
 function Catalog({ deviceType, selected, onSelect, onDeploy, onSkip, onDashboard }) {
   const [items, setItems] = useState(null);
   const [err, setErr] = useState(null);
@@ -963,53 +1011,20 @@ function Catalog({ deviceType, selected, onSelect, onDeploy, onSkip, onDashboard
       <hr className="hr" />
       <div className="between">
         <span className="muted">{selected ? <>Selected: <b>{selected.name}</b></> : "Nothing selected yet"}</span>
-        {(profile && profile.deploy && profile.deploy.programFormat === ".hex") || (selected && selected.format === ".hex") ? (
-          <div className="row" style={{ gap: 8 }}>
-            {navigator.hid ? (
-              <button className="btn" disabled={!selected}
-                onClick={() => selected && setFlashOverlay(selected)}>
-                Flash with FunConnect →
+        <div className="row" style={{ gap: 8 }}>
+          {(profile && profile.catalog && profile.catalog.actions ? profile.catalog.actions : []).map(a => {
+            if (a.requires && !capabilityCheck(a.requires)) return null;
+            const handlers = { setFlashOverlay, setOverlay, onDeploy, onSkip, onDashboard };
+            return (
+              <button key={a.id}
+                className={(a.primary ? "btn" : "btn ghost") + (a.sm ? " sm" : "")}
+                disabled={!selected}
+                onClick={() => handleCatalogAction(a.id, selected, handlers)}>
+                {a.label}
               </button>
-            ) : null}
-            <button className="btn ghost" disabled={!selected}
-              onClick={() => selected && setOverlay(selected)}>
-              Save to micro:bit →
-            </button>
-            <button className="btn ghost" disabled={!selected}
-              onClick={async () => {
-                if (!selected) return;
-                try {
-                  const r = await fetch(API_BASE + "/api/catalog/" + encodeURIComponent(selected.id));
-                  const src = await r.text();
-                  await navigator.clipboard.writeText(src);
-                } catch {}
-                openMakeCodePopup();
-              }}>
-              Open in Editor →
-            </button>
-            {selected && (
-              <button className="btn ghost sm" style={{ fontSize: 12 }}
-                onClick={() => downloadHex(selected.id, selected.name)}>
-                ↓ Download .hex instead
-              </button>
-            )}
-          </div>
-        ) : (
-          <div className="row" style={{ gap: 8 }}>
-            {navigator.serial ? (
-              <button className="btn" disabled={!selected}
-                onClick={() => selected && setFlashOverlay(selected)}>
-                Flash with FunConnect →
-              </button>
-            ) : null}
-            <button className="btn ghost" disabled={!selected} onClick={onDeploy}>
-              Open in mBlock →
-            </button>
-            <button className="btn ghost sm" onClick={onSkip}>
-              Skip to Dashboard →
-            </button>
-          </div>
-        )}
+            );
+          })}
+        </div>
       </div>
     </div>
     {flashOverlay && (flashOverlay.format === ".hex" || (DEVICE_PROFILES.microbit.catalogTag && flashOverlay.tags && flashOverlay.tags.includes("microbit")) ? (
@@ -1526,7 +1541,7 @@ function Dashboard({ deviceId, setDeviceId, follow = true, showDeviceControls = 
               <StatusPill state={auto ? (discovered ? "ok" : "wait") : "wait"}
                           label={!auto ? "Manual" : discovered ? "Auto-following" : "Auto · discovery pending"} />
             )}
-            <StatusPill state={online ? "ok" : "bad"} label={online ? "Device Online" : "Offline"} />
+            <div aria-live="polite" aria-atomic="true"><StatusPill state={online ? "ok" : "bad"} label={online ? "Device Online" : "Offline"} /></div>
             <StatusPill state={wsUp ? "ok" : "wait"} label={wsUp ? "Live Stream Connected" : "Live Stream Pending"} />
             {relayActive && (
               <>
@@ -1552,33 +1567,25 @@ function Dashboard({ deviceId, setDeviceId, follow = true, showDeviceControls = 
         )}
       </div>
 
-      {!online && (deviceType === "microbit" ? (
-          <div className="card" style={{
-            textAlign: "center", padding: 32,
-            background: "var(--panel-2)", border: "1.5px solid var(--line)",
-          }}>
-            <div style={{ fontSize: 40, marginBottom: 12 }}>✓</div>
-            <h3 style={{ marginBottom: 8 }}>Program Running</h3>
-            <p className="muted" style={{ margin: 0, fontSize: 14 }}>
-              Your program is on the micro:bit. Look at the LEDs.
-            </p>
-            <p className="muted" style={{ marginTop: 8, fontSize: 12 }}>
-              Live dashboard requires a V2 micro:bit with USB relay.
-            </p>
+      {!online && (
+        !wsTried ? (
+          <div className="grid cols-2">
+            <div className="card" style={{padding:24}}><div className="skeleton skeleton-stat" /></div>
+            <div className="card" style={{padding:24}}><div className="skeleton skeleton-stat" /></div>
+          </div>
+        ) : deviceType === "microbit" ? (
+          <div className="card" style={{textAlign:"center",padding:32,background:"var(--panel-2)",border:"1.5px solid var(--line)"}}>
+            <div style={{fontSize:40,marginBottom:12}}>✓</div>
+            <h3 style={{marginBottom:8}}>Program Running</h3>
+            <p className="muted" style={{margin:0,fontSize:14}}>Your program is on the micro:bit. Look at the LEDs!</p>
+            <p className="muted" style={{marginTop:8,fontSize:12}}>Connect a V2 micro:bit with USB for live telemetry and LED control.</p>
           </div>
         ) : (
-          <div className="card" style={{
-            textAlign: "center", padding: 32,
-            background: "var(--panel-2)", border: "1.5px dashed var(--line)",
-          }}>
-            <div style={{ fontSize: 40, marginBottom: 12, opacity: .5 }}>⏳</div>
-            <h3 style={{ marginBottom: 8 }}>Waiting for {profile.name}…</h3>
-            <p className="muted" style={{ margin: 0, fontSize: 14 }}>
-              Power on your CyberPi and ensure it's connected to WiFi.
-            </p>
-            <p className="muted" style={{ marginTop: 8, fontSize: 12 }}>
-              The dashboard will update automatically when the device comes online.
-            </p>
+          <div className="card" style={{textAlign:"center",padding:32,background:"var(--panel-2)",border:"1.5px dashed var(--line)"}}>
+            <div style={{fontSize:40,marginBottom:12,opacity:.5}}>⏳</div>
+            <h3 style={{marginBottom:8}}>{profile.name} Not Responding</h3>
+            <p className="muted" style={{margin:0,fontSize:14}}>{deviceType === "cyberpi" ? "Power on your CyberPi and ensure it is connected to WiFi." : "Power on your " + profile.name + " and ensure it is connected."}</p>
+            <p className="muted" style={{marginTop:8,fontSize:12}}>The dashboard will update automatically when the device comes online.</p>
           </div>
         ))}
 
@@ -1653,16 +1660,29 @@ function Dashboard({ deviceId, setDeviceId, follow = true, showDeviceControls = 
           {/* LED Matrix preview + pattern buttons */}
           <div className="card">
             <h3 style={{ marginBottom: 12 }}>LED Matrix</h3>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 28px)", gap: 4, justifyContent: "center", marginBottom: 14 }}>
-              {(LED_PATTERNS[ledPattern] || LED_PATTERNS.clear).map((v, i) => (
-                <div key={i} style={{
-                  width: 24, height: 24, borderRadius: "50%",
-                  background: v ? "var(--brand)" : "var(--line)",
-                  boxShadow: v ? "0 0 8px var(--brand)" : "none",
-                  transition: "background .15s, box-shadow .15s",
-                }} />
-              ))}
-            </div>
+            <div style={{display:"flex",justifyContent:"center",marginBottom:14}}>
+            <svg width="160" height="160" viewBox="0 0 160 160" role="img" aria-label={"LED matrix: " + ledPattern}>
+              <defs>
+                <filter id="ledGlow">
+                  <feGaussianBlur stdDeviation="3" result="blur"/>
+                  <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+                </filter>
+              </defs>
+              {(LED_PATTERNS[ledPattern] || LED_PATTERNS.clear).map((v, i) => {
+                const row = Math.floor(i / 5), col = i % 5;
+                const cx = 20 + col * 30, cy = 20 + row * 30;
+                return (
+                  <g key={i}>
+                    <circle cx={cx} cy={cy} r="12" fill="var(--panel-2)" stroke="var(--line)" strokeWidth="1.5"/>
+                    <circle cx={cx} cy={cy} r="8"
+                      fill={v ? "var(--brand)" : "var(--line)"}
+                      filter={v ? "url(#ledGlow)" : undefined}
+                      style={{transition:"fill .15s ease"}}/>
+                  </g>
+                );
+              })}
+            </svg>
+          </div>
             <div className="row" style={{ gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
               {[
                 { pattern: "heart", label: "❤️ Heart" },
@@ -1792,6 +1812,7 @@ function PublicFlow() {
               <h1>FunConnect</h1>
               <div className="sub">Plug in · Pick a program · Go</div>
             </div>
+            <button className="btn ghost sm" style={{fontSize:16}} onClick={() => { const t = document.documentElement.getAttribute("data-theme") || "system"; const next = t === "dark" ? "light" : t === "light" ? "system" : "dark"; document.documentElement.setAttribute("data-theme", next === "system" ? "" : next); try { localStorage.setItem("fc_theme", next); } catch {} }} aria-label="Toggle theme" title="Toggle theme">{(() => { try { const t = localStorage.getItem("fc_theme") || "system"; return t === "dark" ? "☀" : t === "light" ? "☾" : "◐"; } catch { return "◐"; } })()}</button>
             <a className="btn ghost sm" href="#login" style={{ textDecoration: "none" }}>Admin →</a>
           </div>
           <Stepper current={step} />
@@ -1799,7 +1820,7 @@ function PublicFlow() {
       )}
 
       {step === "detect"    && <DeviceDetection onSelect={(id) => { setDeviceType(id); setStep("catalog"); }} />}
-      {step === "catalog"   && <Catalog deviceType={deviceType} selected={program} onSelect={setProgram} onDeploy={() => program && setStep("deploy")} onSkip={() => setStep("dashboard")} onDashboard={() => { window.location.hash = "dashboard"; }} />}
+      {step === "catalog"   && <Catalog deviceType={deviceType} selected={program} onSelect={setProgram} onDeploy={() => program && setStep("deploy")} onSkip={() => setStep("dashboard")} onDashboard={() => setStep("dashboard")} />}
       {step === "deploy"    && <Deploy deviceType={deviceType} program={program} deviceId={deviceId} setDeviceId={setDeviceId} 
                                        onLive={() => setStep("dashboard")} onCancel={() => setStep("catalog")} toast={toast} />}
       {step === "dashboard" && <Dashboard key={deviceId} deviceType={deviceType} deviceId={deviceId} setDeviceId={setDeviceId} />}
@@ -1856,7 +1877,7 @@ function LoginPage({ onSuccess }) {
         <label className="lbl" style={{ marginTop: 12 }}>Password</label>
         <input type="password" value={p} autoComplete="current-password" onChange={e => setP(e.target.value)} />
 
-        {err && <p className="err" style={{ marginTop: 12 }}>{err}</p>}
+        {err && <p className="err" role="alert" style={{ marginTop: 12 }}>{err}</p>}
 
         <button className="btn lg" type="submit" disabled={busy || !u || !p} style={{ marginTop: 18 }}>
           {busy ? <><span className="spinner" /> Signing in…</> : "Login"}
@@ -1970,11 +1991,8 @@ function ConnectWizard({ onDeviceReady, onBrowsePrograms }) {
       if (tCfg && tCfg.deviceId) setDeviceIdState(tCfg.deviceId);
       startSerialRelay(tCfg ? tCfg.deviceId : deviceId);
     } else if (t === "usb" || t === "webhid" || t === "msd" || t === "guided") {
-      // Hand off to Deploy tab — the flash overlay handles connection
-      setSub(20); setSerialState("usb-connected");
-    } else if (t === "webhid" || t === "msd" || t === "guided") {
-      // Browse Programs path — go to Deploy tab
-      setSub(20); setSerialState("usb-connected");
+      // Flash-oriented transports — go to Deploy tab with catalog
+      if (onBrowsePrograms) onBrowsePrograms(deviceType);
     } else if (t === "popup") {
       // Editor popup — device-specific
       if (profile && profile.id === "microbit") openMakeCodePopup();
@@ -2599,6 +2617,7 @@ function AdminShell({ me, token, onLogout }) {
           <div className="brandbar" style={{ marginBottom: 0 }}>
             <div className="logo" style={{ width: 28, height: 28, fontSize: 13, borderRadius: 7 }}>F</div>
             <h1 style={{ fontSize: 15 }}>FunConnect</h1>
+            <button className="btn ghost sm" style={{fontSize:14,padding:"4px 6px",marginLeft:4}} onClick={() => { const t = document.documentElement.getAttribute("data-theme") || "system"; const next = t === "dark" ? "light" : t === "light" ? "system" : "dark"; document.documentElement.setAttribute("data-theme", next === "system" ? "" : next); try { localStorage.setItem("fc_theme", next); } catch {} }} aria-label="Toggle theme" title="Toggle theme">{(() => { try { const t = localStorage.getItem("fc_theme") || "system"; return t === "dark" ? "☀" : t === "light" ? "☾" : "◐"; } catch { return "◐"; } })()}</button>
           </div>
         </div>
 

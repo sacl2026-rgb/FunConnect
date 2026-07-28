@@ -128,15 +128,13 @@ export default {
               const liveData = await liveRes.json() as any;
               online = liveData.online || false;
             } catch { /* DO unreachable */ }
-            if (online) {
-              devices.unshift({
-                device_id: d.device_id,
-                device_type: d.device_type,
-                online: true,
-                last_seen: 0,
-                telemetry_count: 0,
-              });
-            }
+            devices.unshift({
+              device_id: d.device_id,
+              device_type: d.device_type,
+              online,
+              last_seen: 0,
+              telemetry_count: 0,
+            });
           }
         } catch { /* roster unreachable */ }
 
@@ -242,15 +240,13 @@ export default {
               const liveData = await liveRes.json() as any;
               online = liveData.online || false;
             } catch { /* DO unreachable */ }
-            if (online) {
-              devices.unshift({
-                device_id: d.device_id,
-                device_type: d.device_type,
-                online: true,
-                last_seen: 0,
-                telemetry_count: 0,
-              });
-            }
+            devices.unshift({
+              device_id: d.device_id,
+              device_type: d.device_type,
+              online,
+              last_seen: 0,
+              telemetry_count: 0,
+            });
           }
         } catch { /* roster unreachable */ }
 
@@ -499,7 +495,7 @@ export default {
           device_id: deviceId,
           online,
           last_seen_ms: lastSeen * 1000,
-          telemetry_count: total + bufferTelemetry,
+          telemetry_count: total + (total > 0 && bufferTelemetry > 0 ? bufferTelemetry - 1 : bufferTelemetry),
           alert_count: bufferAlerts,
         });
       } catch (err) {

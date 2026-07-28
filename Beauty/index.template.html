@@ -25,6 +25,65 @@
     --radius:   16px;
     --shadow:   0 2px 16px rgba(30,80,50,.07);
   }
+  /* ── Dark mode (auto) ─────────────────────────────────────────── */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:       #0a1a12;
+      --panel:    #0f2418;
+      --panel-2:  #142e1f;
+      --line:     #1e3d2b;
+      --ink:      #d4e8da;
+      --muted:    #6b9b7d;
+      --shadow:   0 2px 16px rgba(0,0,0,.25);
+    }
+    body {
+      background:
+        radial-gradient(1100px 550px at 85% -8%,  rgba(94,201,143,.04),  transparent),
+        radial-gradient(800px  450px at -5%  25%, rgba(77,166,217,.03),  transparent),
+        radial-gradient(600px  350px at 50%  95%, rgba(61,184,114,.03),  transparent),
+        var(--bg);
+    }
+    .overlay-full {
+      background: radial-gradient(1000px 600px at 50% -5%, rgba(94,201,143,.06), transparent),
+                  rgba(10,26,18,.88);
+    }
+    .overlay-note { background: rgba(15,36,24,.92); }
+    .auth-card { box-shadow: 0 4px 30px rgba(0,0,0,.3); }
+    .prog.selected { background: #0f2418; }
+    .step.active { background: #0f2418; }
+    .pulsebar { border-color: rgba(61,184,114,.15); background: rgba(61,184,114,.04); }
+    .btn.ghost:hover { background: #0f2418; }
+    .stat { background: #0f2418; }
+    .tag { background: #0f2418; }
+    .chat-ctx .cx { background: var(--panel-2); }
+    .alert-row:hover { background: #0f2418; }
+    .alert-row.sel { background: #0f2418; }
+    .msg.bot { background: #142e1f; }
+    .msg.bot.error { background: #2a1515; }
+    pre.code { background: #0f2418; }
+    code { background: #142e1f; }
+    .illus { background: linear-gradient(180deg, rgba(94,201,143,.03), rgba(61,184,114,.01)); }
+    .tiltbox { background: linear-gradient(180deg, rgba(94,201,143,.03), rgba(61,184,114,.01)); }
+  }
+  [data-theme="dark"] {
+    --bg:       #0a1a12;
+    --panel:    #0f2418;
+    --panel-2:  #142e1f;
+    --line:     #1e3d2b;
+    --ink:      #d4e8da;
+    --muted:    #6b9b7d;
+    --shadow:   0 2px 16px rgba(0,0,0,.25);
+  }
+  [data-theme="light"] {
+    --bg:       #f5faf7;
+    --panel:    #ffffff;
+    --panel-2:  #edf6f0;
+    --line:     #d4e5da;
+    --ink:      #1b3327;
+    --muted:    #7a9b87;
+    --shadow:   0 2px 16px rgba(30,80,50,.07);
+  }
+
   *, *::before, *::after { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; }
   body {
@@ -308,9 +367,34 @@
   .suggest { display:flex; gap:6px; flex-wrap:wrap; }
   .chat-input { display:flex; gap:8px; }
   .chat-input input { flex:1; width:auto; }
+
+  .skip-link {
+    position:absolute; top:-100px; left:16px; z-index:100;
+    background:var(--brand); color:#fff; padding:8px 16px; border-radius:8px;
+    font-weight:650; text-decoration:none;
+  }
+  .skip-link:focus { top:16px; }
+  .skeleton {
+    background: linear-gradient(90deg, var(--panel-2) 25%, var(--line) 50%, var(--panel-2) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+    border-radius: 8px;
+  }
+  @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+  .skeleton-text { height: 14px; width: 80%; margin-bottom: 8px; }
+  .skeleton-title { height: 20px; width: 50%; margin-bottom: 12px; }
+  .skeleton-stat { height: 60px; border-radius: 14px; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
 </style>
 </head>
 <body>
+<a class="skip-link" href="#main">Skip to dashboard</a>
 <div id="root"></div>
 
 <script>

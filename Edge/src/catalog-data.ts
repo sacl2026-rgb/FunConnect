@@ -242,5 +242,3 @@ while True:
   },
 ];
 
-// Remove the closing "];" and we'll add new entries before it
-// Actually, let me use Python to insert properly

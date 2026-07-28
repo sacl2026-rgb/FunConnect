@@ -15,7 +15,9 @@ export async function flashViaWebSerial(pySource, onProgress) {
   // 1. Get port — NO open, NO close. Just get the object.
   let ports = await navigator.serial.getPorts();
   let port = ports.length > 0 ? ports[0] : null;
-  if (!port) {
+  if (port) {
+    onProgress && onProgress({ phase: "reconnected", detail: "Reconnected to CyberPi — no pairing needed" });
+  } else {
     port = await navigator.serial.requestPort();
   }
   if (!port) throw new Error("No device selected");
